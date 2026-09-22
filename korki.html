@@ -6,278 +6,86 @@
   <title>EduSHOT — Panel Korepetytora</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = { theme: { extend: { fontFamily: { sans: ['"Plus Jakarta Sans"', 'sans-serif'] }, colors: { brand: { primary: '#8B3DFF', magenta: '#D946EF' } } } } }
-  </script>
+  <script>tailwind.config={theme:{extend:{fontFamily:{sans:['"Plus Jakarta Sans"','sans-serif']},colors:{brand:{primary:'#8B3DFF',magenta:'#D946EF'}}}}}</script>
   <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <style>
-    body { font-family: 'Plus Jakarta Sans', sans-serif; background: #FAF8FE; color: #0F172A; min-height: 100vh; }
-    .gradient-btn { background: linear-gradient(135deg, #8B3DFF 0%, #D946EF 100%); transition: transform 0.2s; }
-    .gradient-btn:hover { transform: translateY(-1px); box-shadow: 0 10px 25px rgba(139, 61, 255, 0.4); }
+    body{font-family:'Plus Jakarta Sans',sans-serif;background:#FAF8FE;color:#0F172A;min-height:100vh}.gradient-btn{background:linear-gradient(135deg,#7C3AED,#D946EF);transition:.2s}.gradient-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 12px 28px -8px rgba(139,61,255,.45)}.card{background:white;border:1px solid #F0E8FF;border-radius:24px;box-shadow:0 14px 36px -30px rgba(76,29,149,.55)}.nav-active{background:#F3E8FF;color:#7C3AED}.soft-input{width:100%;border:1px solid #E5E7EB;border-radius:14px;padding:.75rem .9rem;outline:none}.soft-input:focus{border-color:#8B3DFF;box-shadow:0 0 0 3px rgba(139,61,255,.08)}
   </style>
 </head>
-<body class="antialiased">
-  <div id="root"></div>
-  <script type="text/babel">
-    const { useState, useEffect, useRef } = React;
-    
-    // --- USTAWIENIA PRODUKCYJNE (PODMIEŃ) ---
-    const SUPABASE_URL = "https://twoj-projekt.supabase.co"; 
-    const SUPABASE_ANON_KEY = "twoj-klucz-anon"; 
-    const WORKER_URL = "https://twoj-worker.workers.dev"; 
-    
-    const getWorkerApi = (endpoint) => `${WORKER_URL.replace(/\/+$/, '')}${endpoint}`;
-    const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+<body class="antialiased"><div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useMemo,useRef}=React;
+const SUPABASE_URL="https://lmcebpymlekptqowofyg.supabase.co";
+const SUPABASE_ANON_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsbWNlYnB5bWxla3B0cW93b2Z5ZyIsInJlZiI6ImxtY2VicHltbGVrcHRxb3dvZnlnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4Mjc3NzQsImV4cCI6MjEwNTQwMzc3NH0.Be4EjEtdyHctbUtRxVlFIr7Zw-T8eEi7iz-isRO9tc4";
+const SCHEDULER_API_URL=window.EDUSHOT_SCHEDULER_API_URL||"https://edushot-calcom-sync.kebsiux.workers.dev";
+const supabase=window.supabase?.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
+const DAYS=['poniedziałek','wtorek','środa','czwartek','piątek','sobota','niedziela'];
+const defaultAvailability=()=>DAYS.map(day=>({day,active:false,intervals:[{start:'16:00',end:'20:00'}]}));
+const Icon=({name,size=18})=>{const ref=useRef(null);useEffect(()=>{if(ref.current&&window.lucide){ref.current.innerHTML=`<i data-lucide="${name}"></i>`;window.lucide.createIcons({root:ref.current,attrs:{width:size,height:size}})}},[name,size]);return <span ref={ref} className="inline-flex items-center justify-center shrink-0"/>};
+const Toast=({msg,type='success',onClose})=>{useEffect(()=>{const t=setTimeout(onClose,4000);return()=>clearTimeout(t)},[onClose]);return <div className={`fixed bottom-20 md:bottom-6 right-5 z-[100] max-w-sm px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-950 text-white border-slate-700'}`}>{msg}</div>};
+const plDate=d=>d?new Date(`${d}T12:00:00`).toLocaleDateString('pl-PL'):'—';
+const lessonDateTime=l=>new Date(`${l.lesson_date}T${l.time_start||'00:00'}:00`);
+const statusClass=s=>({completed:'bg-emerald-100 text-emerald-700',cancelled:'bg-rose-100 text-rose-700',scheduled:'bg-purple-100 text-purple-700',confirmed:'bg-purple-100 text-purple-700',no_show:'bg-amber-100 text-amber-700'}[s]||'bg-slate-100 text-slate-500');
+async function schedulerRequest(endpoint,session,options={}){const url=`${SCHEDULER_API_URL.replace(/\/+$/,'')}${endpoint.startsWith('/')?endpoint:`/${endpoint}`}`;let res;try{res=await fetch(url,{...options,headers:{Accept:'application/json','Content-Type':'application/json',Authorization:`Bearer ${session.access_token}`,...(options.headers||{})}})}catch{throw new Error('Nie udało się połączyć z systemem rezerwacji.')}const raw=await res.text();let data=null;try{data=raw?JSON.parse(raw):null}catch{}if(!res.ok||data?.ok===false)throw new Error(data?.error?.message||data?.error||data?.message||`Błąd API ${res.status}`);return data?.data??data}
+function TutorApp(){
+  const [session,setSession]=useState(null),[profile,setProfile]=useState(null),[loadingAuth,setLoadingAuth]=useState(true),[authError,setAuthError]=useState(null),[activeTab,setActiveTab]=useState('dashboard'),[toast,setToast]=useState(null);
+  const [lessons,setLessons]=useState([]),[selectedLesson,setSelectedLesson]=useState(null),[availability,setAvailability]=useState(defaultAvailability()),[availabilityLoading,setAvailabilityLoading]=useState(false),[savingAvailability,setSavingAvailability]=useState(false),[timeOff,setTimeOff]=useState([]),[notifications,setNotifications]=useState([]),[reviews,setReviews]=useState([]),[countdown,setCountdown]=useState('—');
+  const [lessonFilter,setLessonFilter]=useState('upcoming'),[settings,setSettings]=useState(()=>{try{return JSON.parse(localStorage.getItem('edushot-tutor-settings'))||{emailNotifications:true,reminder:true}}catch{return {emailNotifications:true,reminder:true}}});
+  const showToast=(msg,type='success')=>setToast({msg,type});
+  useEffect(()=>{if(!supabase){setLoadingAuth(false);return;}supabase.auth.getSession().then(({data:{session:s}})=>s?verifyTutor(s):setLoadingAuth(false));const {data:l}=supabase.auth.onAuthStateChange((_e,s)=>{if(!s){setSession(null);setProfile(null);setLoadingAuth(false)}});return()=>l?.subscription?.unsubscribe()},[]);
+  useEffect(()=>{if(!session||!profile)return;const ch=supabase.channel(`tutor-${profile.id}`).on('postgres_changes',{event:'*',schema:'public',table:'lessons',filter:`tutor_id=eq.${profile.id}`},()=>fetchLessons(profile.id)).on('postgres_changes',{event:'*',schema:'public',table:'notifications',filter:`user_id=eq.${session.user.id}`},fetchNotifications).subscribe();return()=>supabase.removeChannel(ch)},[session,profile]);
+  useEffect(()=>{const id=setInterval(()=>{const n=nextLesson;if(!n){setCountdown('—');return;}const diff=lessonDateTime(n)-new Date();if(diff<=0){setCountdown('Lekcja trwa / start');return;}const h=Math.floor(diff/3600000),m=Math.floor(diff%3600000/60000),s=Math.floor(diff%60000/1000);setCountdown(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`)},1000);return()=>clearInterval(id)});
 
-    const Icon = ({ name, size = 18 }) => {
-      const ref = useRef(null);
-      useEffect(() => { if (ref.current && window.lucide) { ref.current.innerHTML = `<i data-lucide="${name}"></i>`; window.lucide.createIcons({ root: ref.current, attrs: { width: size, height: size } }); } }, [name, size]);
-      return <span ref={ref} className="inline-flex items-center justify-center shrink-0" />;
-    };
+  async function verifyTutor(s){setLoadingAuth(true);setAuthError(null);const {data,error}=await supabase.from('tutors').select('*').eq('auth_user_id',s.user.id).maybeSingle();if(error||!data||data.status!=='active'){await supabase.auth.signOut();setAuthError('To konto nie ma aktywnego dostępu do panelu korepetytora.');setLoadingAuth(false);return;}setSession(s);setProfile(data);await Promise.all([fetchLessons(data.id),fetchNotifications(s.user.id),fetchTimeOff(data.id),fetchReviews(data.id)]);setLoadingAuth(false)}
+  async function handleLogin(e){e.preventDefault();setLoadingAuth(true);const fd=new FormData(e.currentTarget);const {data,error}=await supabase.auth.signInWithPassword({email:fd.get('email'),password:fd.get('password')});if(error){setAuthError('Błędny e-mail lub hasło.');setLoadingAuth(false);return;}await verifyTutor(data.session)}
+  async function fetchLessons(id){const {data,error}=await supabase.from('lessons').select('*').eq('tutor_id',id).order('lesson_date',{ascending:true}).order('time_start',{ascending:true});if(!error)setLessons(data||[])}
+  async function fetchNotifications(uid=session?.user?.id){if(!uid)return;const {data}=await supabase.from('notifications').select('*').eq('user_id',uid).order('created_at',{ascending:false}).limit(100);if(data)setNotifications(data)}
+  async function fetchTimeOff(tid){const {data}=await supabase.from('tutor_time_off').select('*').eq('tutor_id',tid).order('start_at',{ascending:false});if(data)setTimeOff(data)}
+  async function fetchReviews(tid){const {data,error}=await supabase.from('tutor_reviews').select('*').eq('tutor_id',tid).order('created_at',{ascending:false});if(!error)setReviews(data||[]);else setReviews([])}
+  async function fetchAvailability(){if(!session)return;setAvailabilityLoading(true);try{const data=await schedulerRequest('/api/tutor/availability',session,{method:'GET'});const days=data?.availability||data?.days||data;if(Array.isArray(days)&&days.length)setAvailability(days);else if(profile?.schedule_data?.days)setAvailability(profile.schedule_data.days);else setAvailability(defaultAvailability())}catch(e){if(profile?.schedule_data?.days)setAvailability(profile.schedule_data.days);showToast(`${e.message} Pokazuję ostatnio zapisany grafik.`,'error')}finally{setAvailabilityLoading(false)}}
+  useEffect(()=>{if(activeTab==='availability'&&session)fetchAvailability()},[activeTab,session]);
+  async function saveAvailability(){setSavingAvailability(true);try{await schedulerRequest('/api/tutor/availability',session,{method:'PUT',body:JSON.stringify({timeZone:profile?.timezone||'Europe/Warsaw',days:availability})});await supabase.from('tutors').update({schedule_data:{days:availability,timeZone:profile?.timezone||'Europe/Warsaw',updatedAt:new Date().toISOString()}}).eq('id',profile.id);setProfile(p=>({...p,schedule_data:{days:availability,timeZone:p?.timezone||'Europe/Warsaw',updatedAt:new Date().toISOString()}}));showToast('Dostępność została zsynchronizowana.')}catch(e){showToast(e.message,'error')}finally{setSavingAvailability(false)}}
+  function toggleDay(i){setAvailability(a=>a.map((d,idx)=>idx===i?{...d,active:!d.active}:d))} function updateInterval(di,ii,key,val){setAvailability(a=>a.map((d,idx)=>idx===di?{...d,intervals:d.intervals.map((x,j)=>j===ii?{...x,[key]:val}:x)}:d))} function addInterval(i){setAvailability(a=>a.map((d,idx)=>idx===i?{...d,active:true,intervals:[...(d.intervals||[]),{start:'16:00',end:'20:00'}]}:d))} function removeInterval(di,ii){setAvailability(a=>a.map((d,idx)=>idx===di?{...d,intervals:d.intervals.filter((_x,j)=>j!==ii)}:d))}
+  async function addTimeOff(e){e.preventDefault();const fd=new FormData(e.currentTarget);const start=fd.get('start'),end=fd.get('end'),reason=fd.get('reason');if(!start||!end)return;try{let apiOk=false;try{await schedulerRequest('/api/tutor/time-off',session,{method:'POST',body:JSON.stringify({startAt:start,endAt:end,reason})});apiOk=true}catch{}const {error}=await supabase.from('tutor_time_off').insert({tutor_id:profile.id,start_at:start,end_at:end,reason:reason||null});if(error&&!apiOk)throw error;await fetchTimeOff(profile.id);e.currentTarget.reset();showToast('Nieobecność została dodana.')}catch(err){showToast(err.message,'error')}}
+  async function deleteTimeOff(item){try{if(item.provider_id)try{await schedulerRequest(`/api/tutor/time-off/${item.provider_id}`,session,{method:'DELETE'})}catch{}const {error}=await supabase.from('tutor_time_off').delete().eq('id',item.id);if(error)throw error;fetchTimeOff(profile.id);showToast('Nieobecność usunięta.')}catch(e){showToast(e.message,'error')}}
+  async function updateLessonStatus(id,status,attendance){const {error}=await supabase.from('lessons').update({status,attendance,updated_at:new Date().toISOString()}).eq('id',id).eq('tutor_id',profile.id);if(error)showToast(error.message,'error');else{showToast('Status lekcji zapisany.');setSelectedLesson(null);fetchLessons(profile.id)}}
+  async function saveProfile(e){e.preventDefault();const fd=new FormData(e.currentTarget);const payload={name:String(fd.get('name')||'').trim(),status:profile.status};const {data,error}=await supabase.from('tutors').update(payload).eq('id',profile.id).select('*').single();if(error)showToast(error.message,'error');else{setProfile(data);showToast('Profil został zapisany.')}}
+  async function markNotificationRead(n){if(n.read_at)return;await supabase.from('notifications').update({read_at:new Date().toISOString()}).eq('id',n.id);fetchNotifications()}
+  async function markAllRead(){const ids=notifications.filter(n=>!n.read_at).map(n=>n.id);if(!ids.length)return;await supabase.from('notifications').update({read_at:new Date().toISOString()}).in('id',ids);fetchNotifications();}
 
-    const Toast = ({ msg, type, onClose }) => {
-      useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
-      return (
-        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold flex items-center gap-3 border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-900 text-white border-slate-700'}`}>
-          <span className={type==='error'?'text-rose-400':'text-emerald-400'}>{type==='error'?'✕':'✓'}</span><span>{msg}</span>
-        </div>
-      );
-    };
+  const now=new Date(); const upcoming=useMemo(()=>lessons.filter(l=>!['cancelled','completed'].includes(l.status)&&lessonDateTime(l)>=new Date(now.getTime()-2*60*60*1000)).sort((a,b)=>lessonDateTime(a)-lessonDateTime(b)),[lessons]); const nextLesson=upcoming[0]; const todayKey=new Date().toISOString().slice(0,10); const todayLessons=useMemo(()=>lessons.filter(l=>l.lesson_date===todayKey).sort((a,b)=>(a.time_start||'').localeCompare(b.time_start||'')),[lessons,todayKey]);
+  const weekly=useMemo(()=>{const start=new Date();start.setHours(0,0,0,0);start.setDate(start.getDate()-((start.getDay()+6)%7));const end=new Date(start);end.setDate(end.getDate()+7);const inWeek=lessons.filter(l=>{const d=lessonDateTime(l);return d>=start&&d<end});return{all:inWeek.length,completed:inWeek.filter(l=>l.status==='completed').length,minutes:inWeek.filter(l=>l.status==='completed').reduce((s,l)=>s+Number(l.duration_minutes||60),0),upcoming:inWeek.filter(l=>!['completed','cancelled'].includes(l.status)&&lessonDateTime(l)>=new Date()).length}},[lessons]);
+  const availabilityHours=useMemo(()=>availability.reduce((sum,d)=>sum+(d.active?(d.intervals||[]).reduce((x,i)=>{const [sh,sm]=i.start.split(':').map(Number),[eh,em]=i.end.split(':').map(Number);return x+Math.max(0,(eh*60+em-sh*60-sm)/60)},0):0),0),[availability]);
+  const unread=notifications.filter(n=>!n.read_at).length;
+  const filteredLessons=useMemo(()=>lessons.filter(l=>lessonFilter==='today'?l.lesson_date===todayKey:lessonFilter==='upcoming'?!['completed','cancelled'].includes(l.status)&&lessonDateTime(l)>=new Date():lessonFilter==='completed'?l.status==='completed':lessonFilter==='cancelled'?l.status==='cancelled':true).sort((a,b)=>lessonDateTime(a)-lessonDateTime(b)),[lessons,lessonFilter,todayKey]);
+  const avgReview=reviews.length?(reviews.reduce((s,r)=>s+Number(r.rating||0),0)/reviews.length).toFixed(1):'—';
+  const Nav=({id,label,icon,badge})=><button onClick={()=>setActiveTab(id)} className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl text-sm font-bold ${activeTab===id?'nav-active':'text-slate-500 hover:bg-purple-50'}`}><Icon name={icon}/><span className="flex-1 text-left">{label}</span>{badge>0&&<span className="text-[9px] bg-purple-100 text-brand-primary px-2 py-1 rounded-full">{badge}</span>}</button>;
+  if(loadingAuth)return <div className="min-h-screen grid place-items-center"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"/></div>;
+  if(!session)return <div className="min-h-screen grid place-items-center p-4"><div className="card w-full max-w-md p-9 text-center"><div className="text-3xl font-black mb-2">Edu<span className="text-brand-primary">SHOT</span>.</div><div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-7">Panel korepetytora</div>{authError&&<div className="mb-4 p-3 rounded-xl bg-rose-50 text-rose-700 text-xs font-bold">{authError}</div>}<form onSubmit={handleLogin} className="space-y-4 text-left"><input className="soft-input" name="email" type="email" required placeholder="E-mail"/><input className="soft-input" name="password" type="password" required placeholder="Hasło"/><button className="gradient-btn w-full py-4 rounded-2xl text-white font-black">Zaloguj się</button></form></div></div>;
+  return <div className="min-h-screen flex pb-20 md:pb-0">{toast&&<Toast {...toast} onClose={()=>setToast(null)}/>}<aside className="hidden md:flex fixed inset-y-0 w-[270px] bg-white border-r border-purple-100 p-5 flex-col justify-between"><div><div className="text-xl font-black px-2 mb-8">Edu<span className="text-brand-primary">SHOT</span>.</div><nav className="space-y-1.5"><Nav id="dashboard" label="Pulpit" icon="layout-dashboard"/><Nav id="availability" label="Moja dostępność" icon="calendar-clock"/><Nav id="lessons" label="Moje lekcje" icon="video" badge={upcoming.length}/><Nav id="reviews" label="Moje opinie" icon="star"/><Nav id="profile" label="Mój profil" icon="user-round"/><Nav id="notifications" label="Powiadomienia" icon="bell" badge={unread}/><Nav id="settings" label="Ustawienia" icon="sliders-horizontal"/></nav></div><div className="border-t pt-4 flex items-center gap-3"><div className="w-10 h-10 rounded-2xl bg-purple-100 text-brand-primary grid place-items-center font-black">{profile?.name?.[0]||'T'}</div><div className="min-w-0 flex-1"><div className="font-black text-xs truncate">{profile?.name}</div><div className="text-[10px] text-slate-400">Aktywny</div></div><button onClick={()=>supabase.auth.signOut()}><Icon name="log-out" size={16}/></button></div></aside><main className="flex-1 md:pl-[270px] w-full p-4 sm:p-7 lg:p-8 max-w-[1500px] mx-auto">
+    {activeTab==='dashboard'&&<section className="space-y-6"><div className="flex flex-col sm:flex-row sm:justify-between gap-3"><div><h1 className="text-3xl font-black">Cześć, {profile?.name?.split(' ')[0]} 👋</h1><p className="text-sm text-slate-500 mt-1">Oto podsumowanie Twojego dnia w EduSHOT.</p></div><button onClick={()=>setActiveTab('availability')} className="gradient-btn text-white px-5 py-3 rounded-2xl text-xs font-black self-start">Uzupełnij dostępność</button></div>{nextLesson?<div className="card p-6 lg:p-8 bg-gradient-to-br from-white to-purple-50"><div className="flex flex-col lg:flex-row gap-6 lg:items-center justify-between"><div><div className="flex gap-2 mb-3"><span className="text-[9px] font-black px-2 py-1 rounded-full bg-purple-100 text-brand-primary">NAJBLIŻSZA LEKCJA</span><span className="text-[9px] font-black px-2 py-1 rounded-full bg-amber-100 text-amber-700">NADCHODZI</span></div><h2 className="text-2xl sm:text-3xl font-black">{nextLesson.subject} — {nextLesson.level||'zajęcia'}</h2><div className="text-sm text-slate-500 mt-3">Uczeń: <b className="text-slate-900">{nextLesson.student_name}</b> • {nextLesson.duration_minutes||60} min</div></div><div className="lg:text-right"><div className="text-[10px] uppercase font-black text-slate-400">Do rozpoczęcia</div><div className="text-3xl font-black text-brand-primary font-mono">{countdown}</div><div className="text-xs text-slate-400 mt-1">{plDate(nextLesson.lesson_date)} • {nextLesson.time_start}</div><div className="flex gap-2 mt-4"><button onClick={()=>setSelectedLesson(nextLesson)} className="px-4 py-3 rounded-xl border bg-white text-xs font-black">Szczegóły</button>{nextLesson.meet_url?<a href={nextLesson.meet_url} target="_blank" className="gradient-btn px-4 py-3 rounded-xl text-white text-xs font-black">Przejdź do lekcji</a>:<button disabled className="px-4 py-3 rounded-xl bg-slate-100 text-slate-400 text-xs font-black">Brak linku</button>}</div></div></div></div>:<div className="card p-8"><div className="font-black text-xl">Brak nadchodzących lekcji 🎉</div><div className="text-sm text-slate-400 mt-1">Gdy pojawi się rezerwacja, zobaczysz ją tutaj automatycznie.</div></div>}
+    <div className="grid lg:grid-cols-2 gap-5"><div className="card p-5"><div className="flex justify-between items-start"><div><div className="text-[10px] uppercase font-black text-emerald-600">Dostępność na przyszły tydzień</div><h3 className="font-black text-lg mt-2">{availabilityHours>0?'Grafik jest uzupełniony.':'Uzupełnij grafik na kolejny tydzień.'}</h3><p className="text-xs text-slate-400 mt-2">{availabilityHours.toFixed(1)} h otwartych na nowe rezerwacje.</p></div><Icon name="calendar-check" size={22}/></div><div className="border-t mt-5 pt-4 flex justify-between items-center"><span className="text-[10px] text-slate-400">Synchronizacja z Cal.com przez EduSHOT</span><button onClick={()=>setActiveTab('availability')} className="text-xs font-black text-brand-primary">Edytuj dostępność</button></div></div><div className="card p-5"><div className="font-black text-lg mb-3">Mój tydzień</div><div className="grid grid-cols-2 gap-3"><div className="bg-slate-50 rounded-2xl p-4"><div className="text-[9px] uppercase text-slate-400 font-black">Przeprowadzone</div><div className="text-2xl font-black">{weekly.completed}</div></div><div className="bg-slate-50 rounded-2xl p-4"><div className="text-[9px] uppercase text-slate-400 font-black">Czas korepetycji</div><div className="text-2xl font-black">{(weekly.minutes/60).toFixed(1)} h</div></div><div className="bg-slate-50 rounded-2xl p-4"><div className="text-[9px] uppercase text-slate-400 font-black">Nadchodzące</div><div className="text-2xl font-black">{weekly.upcoming}</div></div><div className="bg-slate-50 rounded-2xl p-4"><div className="text-[9px] uppercase text-slate-400 font-black">Średnia ocena</div><div className="text-2xl font-black text-amber-500">{avgReview}</div></div></div></div></div>
+    <div><div className="flex justify-between mb-3"><h3 className="font-black text-lg">Twoje lekcje dzisiaj</h3><span className="text-xs font-black text-brand-primary">{todayLessons.length} zaplanowane</span></div><div className="space-y-2">{todayLessons.map(l=><button key={l.id} onClick={()=>setSelectedLesson(l)} className="card w-full p-4 flex gap-4 items-center text-left"><div className="w-16 text-center font-black text-brand-primary">{l.time_start}<div className="text-[9px] text-slate-400">{l.duration_minutes||60} min</div></div><div className="flex-1"><div className="font-black text-sm">{l.subject} — {l.level||'zajęcia'}</div><div className="text-xs text-slate-400">Uczeń: <b className="text-slate-600">{l.student_name}</b></div></div><span className={`text-[9px] font-black px-2 py-1 rounded-full uppercase ${statusClass(l.status)}`}>{l.status}</span></button>)}{!todayLessons.length&&<div className="card p-8 text-center text-slate-400">Dzisiaj nie masz lekcji.</div>}</div></div></section>}
 
-    function TutorApp() {
-      const [session, setSession] = useState(null);
-      const [tutorProfile, setTutorProfile] = useState(null);
-      const [loadingAuth, setLoadingAuth] = useState(true);
-      const [activeTab, setActiveTab] = useState('dashboard');
-      
-      const [lessons, setLessons] = useState([]);
-      const [selectedLesson, setSelectedLesson] = useState(null);
-      
-      const [availability, setAvailability] = useState([]);
-      const [toast, setToast] = useState(null);
+    {activeTab==='availability'&&<section className="space-y-5"><div><h1 className="text-2xl font-black">Moja dostępność</h1><p className="text-sm text-slate-400 mt-1">Zmiany zapisane tutaj są wysyłane do Cal.com przez backend EduSHOT.</p></div><div className="card p-5">{availabilityLoading?<div className="p-8 text-center">Ładowanie grafiku...</div>:<div className="space-y-3">{availability.map((d,di)=><div key={d.day||di} className="p-4 rounded-2xl bg-slate-50 border"><div className="flex justify-between items-center mb-3"><div className="font-black capitalize">{d.day||DAYS[di]}</div><button onClick={()=>toggleDay(di)} className={`px-3 py-1.5 rounded-full text-[10px] font-black ${d.active?'bg-emerald-100 text-emerald-700':'bg-slate-200 text-slate-500'}`}>{d.active?'AKTYWNY':'WYŁĄCZONY'}</button></div>{d.active&&<div className="space-y-2">{(d.intervals||[]).map((it,ii)=><div key={ii} className="flex flex-col sm:flex-row gap-2 sm:items-center"><input type="time" className="soft-input sm:w-36" value={it.start} onChange={e=>updateInterval(di,ii,'start',e.target.value)}/><span className="hidden sm:inline">—</span><input type="time" className="soft-input sm:w-36" value={it.end} onChange={e=>updateInterval(di,ii,'end',e.target.value)}/><button onClick={()=>removeInterval(di,ii)} className="px-3 py-2 rounded-xl bg-rose-50 text-rose-600 text-xs font-black">Usuń</button></div>)}<button onClick={()=>addInterval(di)} className="text-xs font-black text-brand-primary">+ Dodaj przedział</button></div>}</div>)}</div>}<button disabled={savingAvailability} onClick={saveAvailability} className="gradient-btn text-white w-full py-4 rounded-2xl font-black text-sm mt-5">{savingAvailability?'Zapisywanie...':'Zapisz dostępność'}</button></div><div className="card p-5"><h2 className="font-black text-lg mb-4">Nieobecności</h2><form onSubmit={addTimeOff} className="grid sm:grid-cols-4 gap-3 mb-5"><input name="start" type="datetime-local" required className="soft-input"/><input name="end" type="datetime-local" required className="soft-input"/><input name="reason" placeholder="Powód (opcjonalnie)" className="soft-input"/><button className="gradient-btn text-white rounded-xl font-black text-xs">Dodaj nieobecność</button></form><div className="space-y-2">{timeOff.map(x=><div key={x.id} className="p-3 bg-slate-50 rounded-xl flex justify-between gap-3 text-xs"><div><b>{new Date(x.start_at).toLocaleString('pl-PL')}</b> → {new Date(x.end_at).toLocaleString('pl-PL')}<div className="text-slate-400">{x.reason||'Nieobecność'}</div></div><button onClick={()=>deleteTimeOff(x)} className="text-rose-600 font-black">Usuń</button></div>)}{!timeOff.length&&<div className="text-xs text-slate-400">Brak zaplanowanych nieobecności.</div>}</div></div></section>}
 
-      const showToast = (msg, type='success') => setToast({msg, type});
+    {activeTab==='lessons'&&<section className="space-y-5"><div className="flex gap-2 overflow-auto pb-1">{[['upcoming','Nadchodzące'],['today','Dzisiaj'],['completed','Zakończone'],['cancelled','Anulowane'],['all','Wszystkie']].map(([id,label])=><button key={id} onClick={()=>setLessonFilter(id)} className={`shrink-0 px-4 py-2 rounded-xl text-xs font-black border ${lessonFilter===id?'bg-purple-100 text-brand-primary border-purple-200':'bg-white text-slate-500'}`}>{label}</button>)}</div><div className="space-y-2">{filteredLessons.map(l=><button key={l.id} onClick={()=>setSelectedLesson(l)} className="card p-4 w-full flex gap-4 items-center text-left"><div className="w-16 font-black text-brand-primary text-center">{l.time_start}<div className="text-[9px] text-slate-400">{plDate(l.lesson_date)}</div></div><div className="flex-1"><div className="font-black text-sm">{l.subject} • {l.level||'—'}</div><div className="text-xs text-slate-400">{l.student_name}</div></div><span className={`text-[9px] font-black px-2 py-1 rounded-full uppercase ${statusClass(l.status)}`}>{l.status}</span></button>)}{!filteredLessons.length&&<div className="card p-10 text-center text-slate-400">Brak lekcji.</div>}</div></section>}
 
-      useEffect(() => {
-        if(!supabase) return;
-        supabase.auth.getSession().then(({ data: { session } }) => {
-          if (session) verifyTutor(session); else setLoadingAuth(false);
-        });
-        supabase.auth.onAuthStateChange((_e, session) => {
-          if (!session) { setSession(null); setTutorProfile(null); setLoadingAuth(false); }
-        });
-      }, []);
+    {activeTab==='reviews'&&<section className="space-y-5"><div className="grid sm:grid-cols-2 gap-4"><div className="card p-6"><div className="text-xs text-slate-400 font-black uppercase">Średnia ocena</div><div className="text-4xl font-black text-amber-500 mt-2">{avgReview}</div><div className="text-xs text-slate-400">{reviews.length} opinii</div></div><div className="card p-6"><div className="font-black">Opinie uczniów</div><div className="text-xs text-slate-400 mt-1">Widok aktywuje się, gdy tabela tutor_reviews istnieje w Supabase.</div></div></div><div className="space-y-3">{reviews.map(r=><div key={r.id} className="card p-5"><div className="flex justify-between"><b>{r.student_name||'Uczeń'}</b><span className="text-amber-500 font-black">★ {r.rating}</span></div><div className="text-sm text-slate-500 mt-2">{r.comment||'Bez komentarza'}</div></div>)}{!reviews.length&&<div className="card p-10 text-center text-slate-400">Brak opinii do wyświetlenia.</div>}</div></section>}
 
-      const verifyTutor = async (activeSession) => {
-        setLoadingAuth(true);
-        const { data } = await supabase.from('tutors').select('*').eq('auth_user_id', activeSession.user.id).single();
-        if (data && data.status === 'active') {
-          setSession(activeSession); setTutorProfile(data);
-          fetchLessons(data.id);
-          
-          supabase.channel('tutor-lessons').on('postgres_changes', { event: '*', schema: 'public', table: 'lessons', filter: `tutor_id=eq.${data.id}` }, () => { fetchLessons(data.id); showToast('Grafik zaktualizowany!', 'info'); }).subscribe();
-        } else {
-          await supabase.auth.signOut();
-        }
-        setLoadingAuth(false);
-      };
+    {activeTab==='profile'&&<section className="max-w-2xl"><form onSubmit={saveProfile} className="card p-6 space-y-4"><h2 className="font-black text-xl">Mój profil</h2><label className="text-xs font-bold">Imię i nazwisko<input name="name" defaultValue={profile?.name||''} className="soft-input mt-2"/></label><label className="text-xs font-bold">E-mail<input disabled value={profile?.email||''} className="soft-input mt-2 bg-slate-50"/></label><label className="text-xs font-bold">Strefa czasowa<input disabled value={profile?.timezone||'Europe/Warsaw'} className="soft-input mt-2 bg-slate-50"/></label><div className="p-3 rounded-xl bg-purple-50 text-xs text-slate-600">Publiczne bio, przedmioty i poziomy można dodać po rozszerzeniu tabeli tutors o odpowiednie kolumny. Ten formularz nie udaje zapisu nieistniejących pól.</div><button className="gradient-btn text-white px-5 py-3 rounded-xl text-xs font-black">Zapisz profil</button></form></section>}
 
-      const fetchLessons = async (id) => {
-        const { data } = await supabase.from('lessons').select('*').eq('tutor_id', id).order('lesson_date', { ascending: true });
-        if(data) setLessons(data);
-      };
+    {activeTab==='notifications'&&<section className="space-y-4"><div className="flex justify-between"><div><h2 className="font-black text-xl">Powiadomienia</h2><div className="text-xs text-slate-400">{unread} nieprzeczytanych</div></div><button onClick={markAllRead} className="text-xs font-black text-brand-primary">Oznacz wszystkie</button></div><div className="space-y-2">{notifications.map(n=><button key={n.id} onClick={()=>markNotificationRead(n)} className={`card w-full p-4 text-left ${!n.read_at?'border-purple-200':''}`}><div className="flex justify-between gap-3"><div><div className="font-black text-sm">{n.title}</div><div className="text-xs text-slate-500 mt-1">{n.message}</div></div>{!n.read_at&&<span className="w-2 h-2 rounded-full bg-brand-primary mt-1"/>}</div></button>)}{!notifications.length&&<div className="card p-10 text-center text-slate-400">Wszystko ogarnięte.</div>}</div></section>}
 
-      const handleLogin = async (e) => {
-        e.preventDefault(); setLoadingAuth(true);
-        const { data, error } = await supabase.auth.signInWithPassword({ email: e.target.email.value, password: e.target.password.value });
-        if (error) { alert('Błąd logowania'); setLoadingAuth(false); }
-        else await verifyTutor(data.session);
-      };
-
-      const handleUpdateLessonStatus = async (lessonId, targetStatus, attendanceType) => {
-        const payload = { status: targetStatus, attendance: attendanceType };
-        const { error } = await supabase.from('lessons').update(payload).eq('id', lessonId);
-        if (!error) {
-          setLessons(prev => prev.map(l => l.id === lessonId ? { ...l, ...payload } : l));
-          setSelectedLesson(null);
-          showToast('Status obecności został zapisany w systemie.');
-        } else {
-          showToast('Błąd aktualizacji', 'error');
-        }
-      };
-
-      const fetchAvailability = async () => {
-        try {
-          const res = await fetch(getWorkerApi('/api/tutor/availability'), { headers: { 'Authorization': `Bearer ${session.access_token}` }});
-          if(res.ok) { const data = await res.json(); setAvailability(data.availability || []); }
-        } catch(e) {}
-      };
-
-      const handleUpdateAvailability = async () => {
-        try {
-          const payload = { timeZone: 'Europe/Warsaw', days: availability };
-          const res = await fetch(getWorkerApi('/api/tutor/availability'), { method: 'PUT', headers: { 'Authorization': `Bearer ${session.access_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-          if(res.ok) showToast('Grafik został bezpiecznie zapisany w bazie!'); else showToast('Błąd API.', 'error');
-        } catch(e) { showToast('Błąd połączenia z serwerem.', 'error'); }
-      };
-
-      useEffect(() => { if(activeTab === 'availability' && session) fetchAvailability(); }, [activeTab, session]);
-
-      if (loadingAuth) return <div className="min-h-screen flex items-center justify-center"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"></div></div>;
-
-      if (!session) {
-        return (
-          <div className="min-h-screen flex items-center justify-center px-4">
-            <div className="w-full max-w-md bg-white rounded-[32px] p-10 shadow-2xl border border-purple-100 text-center">
-              <h1 className="text-3xl font-black text-slate-900 mb-2">EduSHOT</h1>
-              <p className="text-xs font-bold text-slate-400 uppercase mb-8">Panel Nauczyciela</p>
-              <form onSubmit={handleLogin} className="space-y-4 text-left">
-                <input type="email" name="email" required placeholder="E-mail" className="w-full px-4 py-3.5 text-sm rounded-2xl border outline-none focus:border-brand-primary" />
-                <input type="password" name="password" required placeholder="Hasło" className="w-full px-4 py-3.5 text-sm rounded-2xl border outline-none focus:border-brand-primary" />
-                <button type="submit" className="w-full py-4 rounded-2xl gradient-btn text-white font-extrabold text-sm shadow-lg">Zaloguj się</button>
-              </form>
-            </div>
-          </div>
-        );
-      }
-
-      return (
-        <div className="min-h-screen flex flex-col pb-20 md:pb-6">
-          {toast && <Toast {...toast} onClose={() => setToast(null)} />}
-          
-          <header className="sticky top-4 z-40 px-4 sm:px-8 max-w-7xl mx-auto w-full">
-            <div className="bg-white/90 backdrop-blur-md rounded-full px-5 py-3 shadow-lg flex justify-between items-center border border-purple-100">
-              <div className="flex items-center gap-6">
-                <div className="flex items-center gap-2 cursor-pointer" onClick={()=>setActiveTab('dashboard')}>
-                  <div className="w-8 h-8 bg-brand-primary text-white rounded-full flex items-center justify-center font-black">⚡</div>
-                  <span className="text-xl font-black text-slate-900">EduSHOT.</span>
-                </div>
-                <nav className="hidden md:flex gap-2 text-sm font-bold text-slate-600">
-                  <button onClick={()=>setActiveTab('dashboard')} className={`px-4 py-2.5 rounded-full transition ${activeTab==='dashboard'?'bg-purple-100 text-brand-primary':'hover:text-slate-900'}`}>Moje Zajęcia</button>
-                  <button onClick={()=>setActiveTab('availability')} className={`px-4 py-2.5 rounded-full transition ${activeTab==='availability'?'bg-purple-100 text-brand-primary':'hover:text-slate-900'}`}>Dostępność godzin</button>
-                </nav>
-              </div>
-              <button onClick={()=>supabase.auth.signOut()} className="text-slate-400 hover:text-rose-600 font-bold text-xs flex items-center gap-2"><Icon name="log-out" size={16}/> Wyloguj</button>
-            </div>
-          </header>
-
-          <main className="flex-1 max-w-5xl mx-auto w-full px-4 sm:px-8 py-8 space-y-6">
-            {activeTab === 'dashboard' && (
-              <div className="space-y-6">
-                <h2 className="text-3xl font-black text-slate-900">Cześć, {tutorProfile.name.split(' ')[0]}! 👋</h2>
-                <div className="bg-white rounded-3xl p-6 md:p-8 border border-purple-100 shadow-sm space-y-5">
-                  <h3 className="font-black text-lg mb-2">Moje zaplanowane zajęcia</h3>
-                  <div className="space-y-3">
-                    {lessons.sort((a,b)=>new Date(b.lesson_date)-new Date(a.lesson_date)).map(l => (
-                      <div key={l.id} className="p-4 sm:p-5 bg-slate-50 rounded-2xl flex flex-col sm:flex-row justify-between items-center gap-4 border border-slate-100 transition">
-                        <div className="flex items-center gap-4 w-full">
-                          <div className="w-14 h-14 rounded-2xl bg-white flex flex-col items-center justify-center font-mono text-brand-primary shadow-sm border border-slate-100">
-                            <span className="text-xs font-black">{l.time_start}</span>
-                            <span className="text-[10px] font-bold text-slate-400">{l.lesson_date.slice(5)}</span>
-                          </div>
-                          <div>
-                            <strong className="text-sm font-black text-slate-900 block">{l.student_name}</strong>
-                            <span className="text-xs font-bold text-slate-500">{l.subject} • {l.level}</span>
-                            <div className="mt-1">
-                              <span className={`text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-wider ${l.status==='completed'?'bg-emerald-100 text-emerald-700':l.status==='cancelled'?'bg-rose-100 text-rose-700':'bg-purple-100 text-brand-primary'}`}>{l.status}</span>
-                            </div>
-                          </div>
-                        </div>
-                        <button onClick={()=>setSelectedLesson(l)} className="w-full sm:w-auto px-6 py-3 rounded-full bg-white border border-purple-200 text-brand-primary font-bold text-xs hover:bg-purple-50 transition shadow-sm">
-                          SZCZEGÓŁY
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'availability' && (
-              <div className="bg-white rounded-3xl p-8 border border-purple-100 shadow-sm space-y-6">
-                <h2 className="text-2xl font-black text-slate-900">Ustaw Grafik</h2>
-                <p className="text-sm text-slate-500">Zaznacz, w jakich godzinach jesteś dostępny. Zapisane dane trafiają bezpiecznie do bazy.</p>
-                <div className="space-y-3">
-                  {availability.length > 0 ? availability.map((d, i) => (
-                    <div key={i} className="flex justify-between items-center p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                      <strong className="capitalize w-32 text-sm">{d.day}</strong>
-                      <div className="flex gap-2">
-                        {d.active ? d.intervals.map((intv, j) => <span key={j} className="bg-white text-brand-primary border border-purple-100 px-3 py-1.5 rounded-full text-xs font-mono font-bold shadow-sm">{intv.start}-{intv.end}</span>) : <span className="text-slate-400 text-xs font-bold">WOLNE</span>}
-                      </div>
-                    </div>
-                  )) : <p className="text-sm text-slate-400 italic">Ładowanie grafiku z serwera...</p>}
-                </div>
-                <button onClick={handleUpdateAvailability} className="w-full py-4 gradient-btn text-white font-black rounded-2xl mt-4 shadow-lg text-sm tracking-wide">ZAPISZ SWÓJ GRAFIK</button>
-              </div>
-            )}
-          </main>
-
-          {/* OSTATECZNY MODAL SZCZEGÓŁÓW Z PRZYCISKAMI KOLOROWYMI */}
-          {selectedLesson && (
-            <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade">
-              <div className="bg-white rounded-[32px] max-w-md w-full p-6 sm:p-8 shadow-2xl space-y-5 relative">
-                <div className="flex justify-between items-center border-b border-slate-100 pb-3">
-                  <h3 className="text-xl font-black text-slate-900">Szczegóły lekcji</h3>
-                  <button onClick={()=>setSelectedLesson(null)} className="text-slate-400 bg-slate-50 p-2 rounded-full"><Icon name="x" size={16}/></button>
-                </div>
-                
-                <div className="bg-purple-50/70 p-5 rounded-2xl text-xs space-y-1.5 border border-purple-100">
-                  <span className="font-extrabold text-brand-primary uppercase text-[10px] block">Dane ucznia:</span>
-                  <span className="text-lg font-black text-slate-900 block">{selectedLesson.student_name}</span>
-                  <span className="text-slate-500 font-medium block">{selectedLesson.student_email || 'Brak e-maila'}</span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
-                    <span className="text-slate-400 font-bold block text-[10px] uppercase">Data:</span>
-                    <strong className="text-slate-800">{selectedLesson.lesson_date}</strong>
-                  </div>
-                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
-                    <span className="text-slate-400 font-bold block text-[10px] uppercase">Godzina:</span>
-                    <strong className="text-slate-800">{selectedLesson.time_start} - {selectedLesson.time_end}</strong>
-                  </div>
-                </div>
-
-                <div>
-                  <span className="font-bold text-slate-400 block text-[10px] uppercase mb-1">Notatka od ucznia z rezerwacji:</span>
-                  <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 text-slate-700 text-xs italic">
-                    "{selectedLesson.student_message || "Brak dodatkowej wiadomości."}"
-                  </div>
-                </div>
-
-                {selectedLesson.status === 'scheduled' && (
-                  <div className="pt-4 border-t border-purple-50">
-                    <span className="text-xs font-bold text-slate-700 block mb-3 text-center">Potwierdź obecność po zajęciach:</span>
-                    <div className="grid grid-cols-1 gap-2.5">
-                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'completed', 'held')} className="p-4 bg-emerald-500 hover:bg-emerald-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
-                        <Icon name="check-circle" size={20} /> ✓ Odbyła się na czas
-                      </button>
-                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'completed', 'late')} className="p-4 bg-amber-500 hover:bg-amber-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
-                        <Icon name="clock" size={20} /> ⏱ Uczeń spóźniony
-                      </button>
-                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'cancelled', 'no_show')} className="p-4 bg-rose-500 hover:bg-rose-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
-                        <Icon name="x-circle" size={20} /> ✕ Uczeń nie przyszedł
-                      </button>
-                    </div>
-                  </div>
-                )}
-
-                {selectedLesson.meet_url && (
-                  <a href={selectedLesson.meet_url} target="_blank" className="flex items-center justify-center gap-2 w-full py-4 mt-2 border-2 border-brand-primary text-brand-primary font-black rounded-xl hover:bg-purple-50 transition text-sm">
-                    <Icon name="video" size={18} /> Otwórz Google Meet
-                  </a>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      );
-    }
-    ReactDOM.createRoot(document.getElementById('root')).render(<TutorApp />);
-  </script>
-</body>
-</html>
+    {activeTab==='settings'&&<section className="max-w-2xl"><div className="card p-6 space-y-5"><h2 className="font-black text-xl">Ustawienia</h2><label className="flex items-center justify-between p-4 rounded-xl bg-slate-50"><span className="text-sm font-bold">Powiadomienia e-mail</span><input type="checkbox" checked={settings.emailNotifications} onChange={e=>setSettings({...settings,emailNotifications:e.target.checked})}/></label><label className="flex items-center justify-between p-4 rounded-xl bg-slate-50"><span className="text-sm font-bold">Przypomnienia o lekcjach</span><input type="checkbox" checked={settings.reminder} onChange={e=>setSettings({...settings,reminder:e.target.checked})}/></label><div className="p-4 rounded-xl bg-purple-50"><div className="font-black text-sm">System rezerwacji</div><div className="text-xs text-slate-500 mt-1">Cal.com jest obsługiwany przez backend EduSHOT. Korepetytor nie musi logować się do Cal.com.</div></div><button onClick={()=>{localStorage.setItem('edushot-tutor-settings',JSON.stringify(settings));showToast('Ustawienia zapisane.')}} className="gradient-btn text-white px-5 py-3 rounded-xl text-xs font-black">Zapisz ustawienia</button></div></section>}
+  </main>
+  <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-white border-t p-2 grid grid-cols-5 gap-1">{[['dashboard','Start','home'],['lessons','Lekcje','video'],['availability','Dostępność','calendar-clock'],['notifications','Alerty','bell'],['profile','Profil','user-round']].map(([id,label,icon])=><button key={id} onClick={()=>setActiveTab(id)} className={`py-2 rounded-xl text-[9px] font-black flex flex-col items-center gap-1 ${activeTab===id?'text-brand-primary bg-purple-50':'text-slate-400'}`}><Icon name={icon} size={17}/>{label}</button>)}</nav>
+  {selectedLesson&&<div className="fixed inset-0 z-[80] bg-slate-950/55 backdrop-blur-sm p-4 flex items-center justify-center" onClick={()=>setSelectedLesson(null)}><div className="card w-full max-w-lg p-6" onClick={e=>e.stopPropagation()}><div className="flex justify-between"><div><div className="text-[10px] uppercase font-black text-brand-primary">Szczegóły lekcji</div><h3 className="font-black text-xl mt-1">{selectedLesson.student_name}</h3></div><button onClick={()=>setSelectedLesson(null)}><Icon name="x"/></button></div><div className="grid grid-cols-2 gap-3 mt-5 text-xs"><div className="bg-slate-50 p-3 rounded-xl"><b>Data</b><div>{plDate(selectedLesson.lesson_date)}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Godzina</b><div>{selectedLesson.time_start}–{selectedLesson.time_end}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Przedmiot</b><div>{selectedLesson.subject}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Poziom</b><div>{selectedLesson.level||'—'}</div></div></div>{selectedLesson.student_message&&<div className="mt-3 p-3 bg-purple-50 rounded-xl text-xs">{selectedLesson.student_message}</div>}<div className="mt-5 space-y-2">{selectedLesson.meet_url&&<a href={selectedLesson.meet_url} target="_blank" className="gradient-btn text-white w-full py-3 rounded-xl font-black text-xs flex justify-center">Otwórz Google Meet</a>}{selectedLesson.status==='scheduled'&&<><button onClick={()=>updateLessonStatus(selectedLesson.id,'completed','held')} className="w-full py-3 rounded-xl bg-emerald-500 text-white font-black text-xs">✓ Lekcja odbyła się</button><button onClick={()=>updateLessonStatus(selectedLesson.id,'completed','late')} className="w-full py-3 rounded-xl bg-amber-500 text-white font-black text-xs">⏱ Uczeń spóźniony</button><button onClick={()=>updateLessonStatus(selectedLesson.id,'no_show','no_show')} className="w-full py-3 rounded-xl bg-rose-500 text-white font-black text-xs">✕ Uczeń nie przyszedł</button></>}</div></div></div>}
+  </div>
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<TutorApp/>);
+</script></body></html>

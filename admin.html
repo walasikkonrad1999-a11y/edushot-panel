@@ -17,413 +17,135 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <style>
-    body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #FAF8FE; color: #0F172A; min-height: 100vh; overflow-x: hidden; }
-    .sidebar-active { background: #8B3DFF; color: #FFFFFF !important; box-shadow: 0 8px 24px -4px rgba(139, 61, 255, 0.35); }
-    .sidebar-active svg { color: #FFFFFF !important; }
-    .gradient-cta { background: linear-gradient(135deg, #7C3AED 0%, #D946EF 100%); transition: transform 0.2s; }
-    .gradient-cta:hover:not(:disabled) { transform: translateY(-1.5px); box-shadow: 0 10px 30px -5px rgba(217, 70, 239, 0.38); }
-    .gradient-cta:disabled { opacity: 0.6; cursor: not-allowed; }
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background:#FAF8FE; color:#0F172A; min-height:100vh; overflow-x:hidden; }
+    .sidebar-active { background:linear-gradient(135deg,#7C3AED,#A855F7); color:white!important; box-shadow:0 10px 26px -8px rgba(124,58,237,.45); }
+    .sidebar-active svg { color:white!important; }
+    .gradient-cta { background:linear-gradient(135deg,#7C3AED 0%,#D946EF 100%); transition:.2s; }
+    .gradient-cta:hover:not(:disabled){ transform:translateY(-1px); box-shadow:0 10px 28px -6px rgba(217,70,239,.35); }
+    .gradient-cta:disabled{opacity:.55;cursor:not-allowed;transform:none}
+    .card { background:white; border:1px solid #F0E8FF; border-radius:24px; box-shadow:0 12px 34px -28px rgba(76,29,149,.45); }
+    .soft-input { width:100%; border:1px solid #E5E7EB; border-radius:14px; padding:.8rem 1rem; outline:none; background:white; }
+    .soft-input:focus { border-color:#8B3DFF; box-shadow:0 0 0 3px rgba(139,61,255,.08); }
+    .tab-btn.active{background:#F3E8FF;color:#7C3AED;border-color:#E9D5FF}
+    @media(max-width:1023px){ .desktop-aside{display:none!important;} }
   </style>
 </head>
 <body class="antialiased">
-  <div id="root"></div>
-  <script type="text/babel">
-    const { useState, useEffect, useMemo, useRef } = React;
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo, useRef } = React;
 
-    // --- USTAWIENIA PRODUKCYJNE (PODMIEŃ) ---
-    const SUPABASE_URL = "https://twoj-projekt.supabase.co"; 
-    const SUPABASE_ANON_KEY = "twoj-klucz-anon"; 
-    const WORKER_URL = "https://twoj-worker.workers.dev"; 
-    
-    // Funkcja bezpiecznego czyszczenia adresu z podwójnych slashy
-    const getWorkerApi = (endpoint) => `${WORKER_URL.replace(/\/+$/, '')}${endpoint}`;
-    
-    const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+const SUPABASE_URL = "https://lmcebpymlekptqowofyg.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsbWNlYnB5bWxla3B0cW93b2Z5ZyIsInJlZiI6ImxtY2VicHltbGVrcHRxb3dvZnlnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODk4Mjc3NzQsImV4cCI6MjEwNTQwMzc3NH0.Be4EjEtdyHctbUtRxVlFIr7Zw-T8eEi7iz-isRO9tc4";
+const ADMIN_API_URL = window.EDUSHOT_ADMIN_API_URL || "https://edushot-admin-api.kebsiux.workers.dev";
+const SCHEDULER_API_URL = window.EDUSHOT_SCHEDULER_API_URL || "https://edushot-calcom-sync.kebsiux.workers.dev";
+const supabase = window.supabase?.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-    const Icon = ({ name, size = 18 }) => {
-      const spanRef = useRef(null);
-      useEffect(() => { if (spanRef.current && window.lucide) { spanRef.current.innerHTML = `<i data-lucide="${name}"></i>`; window.lucide.createIcons({ root: spanRef.current, attrs: { width: size, height: size } }); } }, [name, size]);
-      return <span ref={spanRef} className="inline-flex items-center justify-center shrink-0" />;
-    };
+const Icon = ({name,size=18}) => { const ref=useRef(null); useEffect(()=>{ if(ref.current&&window.lucide){ ref.current.innerHTML=`<i data-lucide="${name}"></i>`; window.lucide.createIcons({root:ref.current,attrs:{width:size,height:size}}); }},[name,size]); return <span ref={ref} className="inline-flex items-center justify-center shrink-0"/>; };
+const Toast = ({msg,type='success',onClose}) => { useEffect(()=>{const t=setTimeout(onClose,4200);return()=>clearTimeout(t)},[onClose]); return <div className={`fixed bottom-5 right-5 z-[120] max-w-sm px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold flex gap-3 border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-950 text-white border-slate-700'}`}><span className={type==='error'?'text-rose-300':'text-emerald-300'}>{type==='error'?'✕':'✓'}</span><span>{msg}</span></div> };
+const money = n => `${Number(n||0).toLocaleString('pl-PL',{minimumFractionDigits:0,maximumFractionDigits:2})} zł`;
+const plDate = d => d ? new Date(`${d}T12:00:00`).toLocaleDateString('pl-PL') : '—';
+const monthLabel = ym => { if(!ym) return '—'; const [y,m]=ym.split('-'); return new Date(Number(y),Number(m)-1,1).toLocaleDateString('pl-PL',{month:'long',year:'numeric'}).replace(/^./,c=>c.toUpperCase()); };
+const monthKeyFromLesson = l => (l.lesson_date||'').slice(0,7);
+const currentMonthKey = () => new Date().toISOString().slice(0,7);
+const dueDateForMonth = ym => { const [y,m]=ym.split('-').map(Number); return new Date(y,m,10); };
+const monthStatus = (ym, paid) => { if(paid) return 'PAID'; const now=new Date(); if(ym===currentMonthKey()) return 'OPEN'; return now>dueDateForMonth(ym)?'OVERDUE':'READY_TO_PAY'; };
+const statusBadge = s => ({completed:'bg-emerald-100 text-emerald-700',cancelled:'bg-rose-100 text-rose-700',scheduled:'bg-purple-100 text-purple-700',confirmed:'bg-purple-100 text-purple-700',no_show:'bg-amber-100 text-amber-700'}[s]||'bg-slate-100 text-slate-600');
 
-    const Toast = ({ msg, type, onClose }) => {
-      useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
-      return (
-        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold flex items-center gap-3 border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-900 text-white border-slate-700'}`}>
-          <span className={type==='error'?'text-rose-400':'text-emerald-400'}>{type==='error'?'✕':'✓'}</span><span>{msg}</span>
-        </div>
-      );
-    };
+async function apiRequest(base, endpoint, session, options={}){
+  const url=`${base.replace(/\/+$/,'')}${endpoint.startsWith('/')?endpoint:`/${endpoint}`}`;
+  let res;
+  try { res=await fetch(url,{...options,headers:{Accept:'application/json','Content-Type':'application/json',...(session?.access_token?{Authorization:`Bearer ${session.access_token}`}:{}) ,...(options.headers||{})}}); }
+  catch(e){ throw new Error(`Brak połączenia z API EduSHOT: ${url}`); }
+  const raw=await res.text(); let data=null; try{data=raw?JSON.parse(raw):null}catch{}
+  if(!res.ok || data?.ok===false) throw new Error(data?.error?.message||data?.error||data?.message||`Błąd API ${res.status}`);
+  return data?.data ?? data;
+}
 
-    const formatMonthYear = (dateStr) => {
-      if(!dateStr) return "Nieznany miesiąc";
-      const m = new Date(dateStr).toLocaleDateString('pl-PL', { month: 'long', year: 'numeric' });
-      return m.charAt(0).toUpperCase() + m.slice(1);
-    };
+function AdminApp(){
+  const [session,setSession]=useState(null), [loadingAuth,setLoadingAuth]=useState(true), [authError,setAuthError]=useState(null);
+  const [loginEmail,setLoginEmail]=useState(''), [loginPassword,setLoginPassword]=useState(''), [adminEmail,setAdminEmail]=useState('');
+  const [activeTab,setActiveTab]=useState('dashboard'), [mobileMenu,setMobileMenu]=useState(false), [toast,setToast]=useState(null), [loadingData,setLoadingData]=useState(false);
+  const [tutors,setTutors]=useState([]), [lessons,setLessons]=useState([]), [finances,setFinances]=useState([]), [students,setStudents]=useState([]), [availability,setAvailability]=useState([]), [timeOff,setTimeOff]=useState([]), [auditLogs,setAuditLogs]=useState([]);
+  const [tableHealth,setTableHealth]=useState({}), [integrationHealth,setIntegrationHealth]=useState({supabase:'unknown',adminApi:'unknown',scheduler:'unknown'});
+  const [addTutorModal,setAddTutorModal]=useState(false), [editTutorData,setEditTutorData]=useState(null), [isActionLoading,setIsActionLoading]=useState(false);
+  const [selectedTutor,setSelectedTutor]=useState(null), [tutorDetailTab,setTutorDetailTab]=useState('summary');
+  const [selectedLesson,setSelectedLesson]=useState(null), [lessonFilter,setLessonFilter]=useState('all'), [lessonSearch,setLessonSearch]=useState('');
+  const [financeMonth,setFinanceMonth]=useState(currentMonthKey());
+  const [settings,setSettings]=useState(()=>{ try{return JSON.parse(localStorage.getItem('edushot-admin-settings'))||{timezone:'Europe/Warsaw',minNotice:30,cancelHours:12,rescheduleHours:6,lessonReminder:60}}catch{return {timezone:'Europe/Warsaw',minNotice:30,cancelHours:12,rescheduleHours:6,lessonReminder:60}} });
+  const showToast=(msg,type='success')=>setToast({msg,type});
 
-    function AdminApp() {
-      const [session, setSession] = useState(null);
-      const [adminEmail, setAdminEmail] = useState('');
-      const [loginEmail, setLoginEmail] = useState('');
-      const [loginPassword, setLoginPassword] = useState('');
-      const [loadingAuth, setLoadingAuth] = useState(true);
-      const [authError, setAuthError] = useState(null);
+  useEffect(()=>{ if(!supabase){setLoadingAuth(false);setAuthError('Nie udało się załadować Supabase.');return;} supabase.auth.getSession().then(({data:{session:s}})=>s?verifyAdmin(s):setLoadingAuth(false)); const {data:listener}=supabase.auth.onAuthStateChange((_e,s)=>{if(!s){setSession(null);setLoadingAuth(false)}}); return()=>listener?.subscription?.unsubscribe(); },[]);
+  useEffect(()=>{ if(!session) return; const ch=supabase.channel('admin-core').on('postgres_changes',{event:'*',schema:'public',table:'lessons'},()=>loadData(false)).on('postgres_changes',{event:'*',schema:'public',table:'tutors'},()=>loadData(false)).subscribe(); return()=>supabase.removeChannel(ch); },[session]);
 
-      const [activeTab, setActiveTab] = useState('dashboard');
-      const [tutors, setTutors] = useState([]);
-      const [lessons, setLessons] = useState([]);
-      const [finances, setFinances] = useState([]);
-      
-      const [addTutorModal, setAddTutorModal] = useState(false);
-      const [editTutorData, setEditTutorData] = useState(null); // Stan trzymajacy dane edytowanego tutora
-      const [toast, setToast] = useState(null);
-      const [isActionLoading, setIsActionLoading] = useState(false);
+  async function verifyAdmin(s){ setLoadingAuth(true); setAuthError(null); const {data,error}=await supabase.from('user_roles').select('role').eq('user_id',s.user.id).maybeSingle(); if(error||data?.role!=='admin'){ await supabase.auth.signOut(); setAuthError('Odmowa dostępu. Wymagane konto administratora.'); setLoadingAuth(false); return;} setSession(s); setAdminEmail(s.user.email||''); await loadData(true); setLoadingAuth(false); }
+  async function handleLogin(e){ e.preventDefault(); setLoadingAuth(true); const {data,error}=await supabase.auth.signInWithPassword({email:loginEmail,password:loginPassword}); if(error){setAuthError('Błędny e-mail lub hasło.');setLoadingAuth(false);return;} await verifyAdmin(data.session); }
 
-      const showToast = (msg, type='success') => setToast({msg, type});
+  async function safeSelect(table, queryFactory){ try{ const q=queryFactory?queryFactory(supabase.from(table)):supabase.from(table).select('*'); const {data,error}=await q; if(error){setTableHealth(h=>({...h,[table]:error.message})); return [];} setTableHealth(h=>({...h,[table]:'ok'})); return data||[]; }catch(e){setTableHealth(h=>({...h,[table]:e.message}));return [];} }
+  async function loadData(spinner=true){ if(!supabase)return; if(spinner)setLoadingData(true); const [t,l,f,s,a,to,logs]=await Promise.all([
+    safeSelect('tutors',q=>q.select('*').order('name')),
+    safeSelect('lessons',q=>q.select('*').order('lesson_date',{ascending:false}).order('time_start',{ascending:false})),
+    safeSelect('lesson_finance',q=>q.select('*')),
+    safeSelect('students',q=>q.select('*').order('created_at',{ascending:false})),
+    safeSelect('tutor_availability',q=>q.select('*')),
+    safeSelect('tutor_time_off',q=>q.select('*').order('start_at',{ascending:false})),
+    safeSelect('audit_logs',q=>q.select('*').order('created_at',{ascending:false}).limit(50))
+  ]); setTutors(t);setLessons(l);setFinances(f);setStudents(s);setAvailability(a);setTimeOff(to);setAuditLogs(logs); setIntegrationHealth(h=>({...h,supabase:'ok'})); if(spinner)setLoadingData(false); }
 
-      useEffect(() => {
-        if(!supabase) return;
-        supabase.auth.getSession().then(({ data: { session } }) => {
-          if (session) verifyAdmin(session); else setLoadingAuth(false);
-        });
-        supabase.auth.onAuthStateChange((event, session) => {
-          if (!session) { setSession(null); setLoadingAuth(false); }
-        });
-      }, []);
+  const derivedStudents=useMemo(()=>{ if(students.length) return students; const map={}; lessons.forEach(l=>{const k=l.student_email||l.student_name;if(!k)return;if(!map[k])map[k]={id:k,name:l.student_name,email:l.student_email||'',derived:true,lessonCount:0};map[k].lessonCount++;});return Object.values(map);},[students,lessons]);
+  const financeMap=useMemo(()=>Object.fromEntries(finances.map(f=>[f.lesson_id,f])),[finances]);
+  const todayKey=new Date().toISOString().slice(0,10);
+  const metrics=useMemo(()=>{ const activeTutors=tutors.filter(t=>t.status==='active').length; const todayLessons=lessons.filter(l=>l.lesson_date===todayKey).length; const monthLessons=lessons.filter(l=>monthKeyFromLesson(l)===currentMonthKey()).length; let revenue=0,cost=0,fee=0; finances.forEach(f=>{revenue+=Number(f.student_price||0);cost+=Number(f.tutor_rate||0);fee+=Number(f.payment_fee||0)}); const toPay=finances.reduce((sum,f)=>{const l=lessons.find(x=>x.id===f.lesson_id);return sum+(l?.status==='completed'&&!f.payout_paid?Number(f.tutor_rate||0):0)},0); return {activeTutors,todayLessons,monthLessons,students:derivedStudents.length,revenue,cost,fee,margin:revenue-cost-fee,toPay}; },[tutors,lessons,finances,derivedStudents,todayKey]);
 
-      const verifyAdmin = async (activeSession) => {
-        setLoadingAuth(true);
-        try {
-          const { data, error } = await supabase.from('user_roles').select('role').eq('user_id', activeSession.user.id).single();
-          if (error || data?.role !== 'admin') throw new Error('Brak uprawnień admina');
-          setSession(activeSession); setAdminEmail(activeSession.user.email);
-          loadData();
-        } catch(e) {
-          await supabase.auth.signOut();
-          setAuthError('Odmowa dostępu. Wymagane konto administratora.');
-        } finally { setLoadingAuth(false); }
-      };
+  const settlementGroups=useMemo(()=>{ const groups={}; lessons.filter(l=>l.status==='completed').forEach(l=>{const f=financeMap[l.id]; if(!f)return; const tutor=tutors.find(t=>t.id===l.tutor_id); if(!tutor)return; const ym=monthKeyFromLesson(l); if(!ym)return; const key=`${tutor.id}_${ym}`; if(!groups[key])groups[key]={key,tutor,monthKey:ym,items:[],amount:0,minutes:0,allPaid:true,lastPaidAt:null}; groups[key].items.push({lesson:l,finance:f}); groups[key].amount+=Number(f.tutor_rate||0); groups[key].minutes+=Number(l.duration_minutes||0); groups[key].allPaid=groups[key].allPaid&&!!f.payout_paid; if(f.payout_date)groups[key].lastPaidAt=f.payout_date; }); return Object.values(groups).sort((a,b)=>b.monthKey.localeCompare(a.monthKey)||a.tutor.name.localeCompare(b.tutor.name)); },[lessons,financeMap,tutors]);
 
-      const loadData = async () => {
-        const [tRes, lRes, fRes] = await Promise.all([
-          supabase.from('tutors').select('*').order('name'),
-          supabase.from('lessons').select('*').order('lesson_date', { ascending: false }),
-          supabase.from('lesson_finance').select('*')
-        ]);
-        if(tRes.data) setTutors(tRes.data);
-        if(lRes.data) setLessons(lRes.data);
-        if(fRes.data) setFinances(fRes.data);
-      };
+  async function handleSaveTutor(e){ e.preventDefault(); setIsActionLoading(true); const fd=new FormData(e.currentTarget); const payload={name:String(fd.get('name')||'').trim(),email:String(fd.get('email')||'').trim().toLowerCase(),iban:String(fd.get('iban')||'').trim(),calSlug:String(fd.get('slug')||'').trim(),timezone:'Europe/Warsaw'}; try{ if(editTutorData){ const {error}=await supabase.from('tutors').update({name:payload.name,iban:payload.iban||null,cal_slug:payload.calSlug||null,cal_url:payload.calSlug?`https://cal.com/${payload.calSlug}`:null,updated_at:new Date().toISOString()}).eq('id',editTutorData.id); if(error)throw error; showToast('Profil korepetytora zaktualizowany.'); } else { await apiRequest(ADMIN_API_URL,'/api/admin/tutors',session,{method:'POST',body:JSON.stringify(payload)}); showToast('Korepetytor utworzony.'); } setAddTutorModal(false);setEditTutorData(null);await loadData(false); }catch(e){showToast(e.message||'Nie udało się zapisać korepetytora.','error')}finally{setIsActionLoading(false)} }
+  async function deactivateTutor(t){ if(!confirm(`Dezaktywować konto ${t.name}?`))return; const {error}=await supabase.from('tutors').update({status:'inactive'}).eq('id',t.id); if(error)showToast(error.message,'error');else{showToast('Korepetytor został dezaktywowany.');loadData(false)} }
+  async function updateLessonStatus(id,status){ const {error}=await supabase.from('lessons').update({status,updated_at:new Date().toISOString()}).eq('id',id); if(error)showToast(error.message,'error');else{showToast('Status lekcji zapisany.');setSelectedLesson(null);loadData(false)} }
+  async function markGroupPaid(group){ if(!confirm(`Oznaczyć ${monthLabel(group.monthKey)} — ${group.tutor.name} jako wypłacone (${money(group.amount)})?`))return; const ids=group.items.map(x=>x.lesson.id); const {error}=await supabase.from('lesson_finance').update({payout_paid:true,payout_date:new Date().toISOString()}).in('lesson_id',ids); if(error)showToast(error.message,'error');else{showToast('Wypłata zapisana w historii.');loadData(false)} }
+  async function checkIntegrations(){ setIntegrationHealth({supabase:'checking',adminApi:'checking',scheduler:'checking'}); let s='ok',a='error',c='error'; try{const {error}=await supabase.from('tutors').select('id').limit(1); if(error)throw error;}catch{s='error'} try{await apiRequest(ADMIN_API_URL,'/api/health',session,{method:'GET'});a='ok'}catch{a='error'} try{await apiRequest(SCHEDULER_API_URL,'/api/health',session,{method:'GET'});c='ok'}catch{c='error'} setIntegrationHealth({supabase:s,adminApi:a,scheduler:c}); }
+  function saveSettings(e){ e.preventDefault(); localStorage.setItem('edushot-admin-settings',JSON.stringify(settings)); showToast('Ustawienia zapisane w tej przeglądarce.'); }
 
-      const handleLogin = async (e) => {
-        e.preventDefault(); setAuthError(null); setLoadingAuth(true);
-        const { data, error } = await supabase.auth.signInWithPassword({ email: loginEmail, password: loginPassword });
-        if (error) { setAuthError('Błędne dane logowania'); setLoadingAuth(false); return; }
-        await verifyAdmin(data.session);
-      };
+  const filteredLessons=useMemo(()=>lessons.filter(l=>{ if(lessonFilter!=='all'&&l.status!==lessonFilter)return false; const term=lessonSearch.toLowerCase(); if(!term)return true; const tutor=tutors.find(t=>t.id===l.tutor_id); return [l.student_name,l.student_email,l.subject,l.level,tutor?.name].some(v=>String(v||'').toLowerCase().includes(term)); }),[lessons,lessonFilter,lessonSearch,tutors]);
+  const monthFinances=useMemo(()=>{ const rows=lessons.filter(l=>monthKeyFromLesson(l)===financeMonth).map(l=>({lesson:l,finance:financeMap[l.id],tutor:tutors.find(t=>t.id===l.tutor_id)})).filter(x=>x.finance); const revenue=rows.reduce((s,x)=>s+Number(x.finance.student_price||0),0), cost=rows.reduce((s,x)=>s+Number(x.finance.tutor_rate||0),0), fee=rows.reduce((s,x)=>s+Number(x.finance.payment_fee||0),0); return {rows,revenue,cost,fee,margin:revenue-cost-fee}; },[lessons,financeMap,tutors,financeMonth]);
 
-      // TWORZENIE LUB EDYCJA TUTORA
-      const handleSaveTutor = async (e) => {
-        e.preventDefault();
-        setIsActionLoading(true);
-        
-        const payload = {
-          name: e.target.name.value.trim(),
-          email: e.target.email.value.trim().toLowerCase(),
-          iban: e.target.iban.value.trim(),
-          calSlug: e.target.slug.value.trim()
-        };
+  const NavItem=({id,label,icon,badge})=><button onClick={()=>{setActiveTab(id);setMobileMenu(false)}} className={`w-full flex items-center gap-3.5 px-4 py-3.5 rounded-2xl font-bold text-sm transition ${activeTab===id?'sidebar-active':'text-slate-500 hover:bg-purple-50 hover:text-slate-800'}`}><Icon name={icon}/><span className="flex-1 text-left">{label}</span>{badge!=null&&<span className="text-[10px] px-2 py-1 rounded-full bg-purple-100 text-purple-700">{badge}</span>}</button>;
+  const Stat=({label,value,accent=false,onClick})=><button onClick={onClick} className={`card p-5 text-left min-h-[112px] hover:-translate-y-0.5 transition ${accent?'border-purple-200':''}`}><span className="block text-[10px] font-extrabold uppercase tracking-wider text-slate-400 mb-2">{label}</span><span className={`text-2xl font-black ${accent?'text-brand-primary':'text-slate-950'}`}>{value}</span></button>;
 
-        try {
-          if (editTutorData) {
-            // Update rekordu bezposrednio przez Supabase
-            const { error } = await supabase.from('tutors').update({
-              name: payload.name, email: payload.email, iban: payload.iban, cal_slug: payload.calSlug, cal_url: payload.calSlug ? `https://cal.com/${payload.calSlug}` : null
-            }).eq('id', editTutorData.id);
-            if (error) throw error;
-            showToast('Profil korepetytora zaktualizowany!');
-          } else {
-            // Nowe konto przez Worker (żeby Supabase Admin API stworzyło usera do logowania)
-            const res = await fetch(getWorkerApi('/api/admin/tutors'), {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
-              body: JSON.stringify(payload)
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || 'Błąd API podczas tworzenia');
-            showToast('Korepetytor dodany, wysłano mail z zaproszeniem!');
-          }
-          
-          setAddTutorModal(false);
-          setEditTutorData(null);
-          loadData();
-        } catch(err) {
-          showToast(err.message, 'error');
-        } finally {
-          setIsActionLoading(false);
-        }
-      };
+  if(loadingAuth) return <div className="min-h-screen flex items-center justify-center"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"/></div>;
+  if(!session) return <div className="min-h-screen flex items-center justify-center p-4"><div className="card w-full max-w-md p-9 text-center"><div className="text-3xl font-black mb-2">Edu<span className="text-brand-primary">SHOT</span>.</div><div className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-8">Centrala Administratora</div>{authError&&<div className="mb-4 p-3 rounded-xl bg-rose-50 text-rose-700 text-xs font-bold">{authError}</div>}<form onSubmit={handleLogin} className="space-y-4"><input className="soft-input" type="email" required value={loginEmail} onChange={e=>setLoginEmail(e.target.value)} placeholder="E-mail administratora"/><input className="soft-input" type="password" required value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} placeholder="Hasło"/><button className="gradient-cta w-full py-4 rounded-2xl text-white font-black">Zaloguj się</button></form></div></div>;
 
-      // USUWANIE (ARCHIWIZACJA) TUTORA
-      const handleDeactivateTutor = async (tutorId, tutorName) => {
-        if (!confirm(`Czy na pewno chcesz usunąć/zdezaktywować nauczyciela ${tutorName}?\nLekcje i finanse zostaną w historii, ale zniknie on z aktywnej listy.`)) return;
-        
-        try {
-          const { error } = await supabase.from('tutors').update({ status: 'inactive' }).eq('id', tutorId);
-          if (error) throw error;
-          showToast(`Konto ${tutorName} zarchiwizowane.`);
-          loadData();
-        } catch (e) { showToast('Błąd usuwania.', 'error'); }
-      };
+  return <div className="min-h-screen flex">{toast&&<Toast {...toast} onClose={()=>setToast(null)}/>} 
+    <aside className="desktop-aside w-[280px] bg-white border-r border-purple-100 p-5 flex flex-col justify-between fixed inset-y-0 z-40"><div><div className="flex items-center gap-2 px-2 mb-8 cursor-pointer" onClick={()=>setActiveTab('dashboard')}><div className="text-xl font-black">Edu<span className="text-brand-primary">SHOT</span>.</div><span className="text-[9px] font-black px-2 py-1 rounded-full bg-purple-100 text-brand-primary">ADMIN</span></div><nav className="space-y-1.5"><NavItem id="dashboard" label="Dashboard" icon="layout-dashboard"/><NavItem id="lessons" label="Lekcje" icon="calendar-days" badge={lessons.length}/><NavItem id="tutors" label="Korepetytorzy" icon="users" badge={tutors.filter(t=>t.status==='active').length}/><NavItem id="students" label="Uczniowie" icon="graduation-cap" badge={derivedStudents.length}/><NavItem id="payouts" label="Rozliczenia" icon="credit-card"/><NavItem id="finance" label="Finanse" icon="chart-no-axes-combined"/><NavItem id="integrations" label="Integracje" icon="plug"/><NavItem id="settings" label="Ustawienia" icon="settings"/></nav></div><div className="border-t pt-5"><div className="text-xs font-black truncate">Administrator EduSHOT</div><div className="text-[10px] text-slate-400 truncate mb-3">{adminEmail}</div><button onClick={()=>supabase.auth.signOut()} className="text-xs font-bold text-slate-500 hover:text-rose-600 flex gap-2"><Icon name="log-out" size={15}/> Wyloguj</button></div></aside>
+    <main className="flex-1 lg:pl-[280px] w-full p-4 sm:p-7 lg:p-8">
+      <header className="card px-4 sm:px-6 py-4 flex items-center justify-between mb-7 sticky top-3 z-30 bg-white/95 backdrop-blur"><div className="flex items-center gap-3"><button className="lg:hidden p-2 rounded-xl bg-purple-50 text-brand-primary" onClick={()=>setMobileMenu(!mobileMenu)}><Icon name="menu"/></button><div><h1 className="font-black text-xl sm:text-2xl">{({dashboard:'Dashboard',lessons:'Lekcje',tutors:'Korepetytorzy',students:'Uczniowie',payouts:'Rozliczenia',finance:'Finanse',integrations:'Integracje',settings:'Ustawienia'})[activeTab]}</h1><p className="text-[11px] text-slate-400 hidden sm:block">Centrala zarządzania EduSHOT</p></div></div><div className="flex items-center gap-2"><span className="hidden sm:flex items-center gap-2 text-[11px] font-bold px-3 py-2 rounded-full bg-emerald-50 text-emerald-700"><span className="w-2 h-2 rounded-full bg-emerald-500"/> System online</span><button onClick={()=>loadData(true)} className="p-2.5 rounded-xl border bg-white hover:text-brand-primary"><Icon name={loadingData?'loader-circle':'refresh-cw'} size={16}/></button></div></header>
+      {mobileMenu&&<div className="lg:hidden card p-3 mb-5 grid grid-cols-2 gap-2"><NavItem id="dashboard" label="Dashboard" icon="layout-dashboard"/><NavItem id="lessons" label="Lekcje" icon="calendar-days"/><NavItem id="tutors" label="Korepetytorzy" icon="users"/><NavItem id="students" label="Uczniowie" icon="graduation-cap"/><NavItem id="payouts" label="Rozliczenia" icon="credit-card"/><NavItem id="finance" label="Finanse" icon="chart-no-axes-combined"/><NavItem id="integrations" label="Integracje" icon="plug"/><NavItem id="settings" label="Ustawienia" icon="settings"/></div>}
 
-      const handleMarkPaid = async (financeIds) => {
-        if(!confirm('Oznaczyć tę paczkę jako wypłaconą? (Zniknie z widoku)')) return;
-        try {
-          const { error } = await supabase.from('lesson_finance').update({ payout_paid: true }).in('lesson_id', financeIds);
-          if (error) throw error;
-          loadData();
-          showToast('Wypłata została odhaczona w bazie!');
-        } catch (e) { showToast('Błąd rozliczenia', 'error'); }
-      };
+      {activeTab==='dashboard'&&<section className="space-y-7"><div><h2 className="text-3xl font-black">Dzień dobry 👋</h2><p className="text-sm text-slate-500 mt-1">Oto co dzieje się dziś w EduSHOT.</p></div><div className="grid grid-cols-2 xl:grid-cols-6 gap-3"><Stat label="Aktywni tutorzy" value={metrics.activeTutors} onClick={()=>setActiveTab('tutors')}/><Stat label="Lekcje dzisiaj" value={metrics.todayLessons} onClick={()=>setActiveTab('lessons')}/><Stat label="W tym miesiącu" value={metrics.monthLessons}/><Stat label="Uczniowie" value={metrics.students} onClick={()=>setActiveTab('students')}/><Stat label="Przychód" value={money(metrics.revenue)} onClick={()=>setActiveTab('finance')}/><Stat label="Do wypłaty" value={money(metrics.toPay)} accent onClick={()=>setActiveTab('payouts')}/></div><div className="grid xl:grid-cols-3 gap-6"><div className="xl:col-span-2"><h3 className="font-black text-lg mb-3">Najnowsze lekcje</h3><div className="card p-4 space-y-2">{lessons.slice(0,8).map(l=>{const t=tutors.find(x=>x.id===l.tutor_id);return <button key={l.id} onClick={()=>setSelectedLesson(l)} className="w-full flex items-center gap-4 p-4 rounded-2xl bg-slate-50 hover:bg-purple-50 text-left"><div className="w-14 h-14 rounded-xl bg-white border flex flex-col justify-center items-center text-brand-primary font-black text-xs"><span>{l.time_start}</span><span className="text-[9px] text-slate-400">{(l.lesson_date||'').slice(5)}</span></div><div className="flex-1 min-w-0"><div className="font-black text-sm truncate">{l.student_name}</div><div className="text-xs text-slate-500 truncate">{l.subject} • {l.level||'—'} • {t?.name||'Brak tutora'}</div></div><span className={`text-[9px] font-black px-2.5 py-1 rounded-full uppercase ${statusBadge(l.status)}`}>{l.status}</span></button>})}{!lessons.length&&<div className="text-sm text-slate-400 p-8 text-center">Brak lekcji.</div>}</div></div><div><h3 className="font-black text-lg mb-3">Szybkie akcje</h3><div className="card p-5 space-y-3"><button onClick={()=>{setEditTutorData(null);setAddTutorModal(true)}} className="gradient-cta text-white w-full py-3.5 rounded-2xl text-xs font-black">+ Dodaj korepetytora</button><button onClick={()=>setActiveTab('payouts')} className="w-full py-3.5 rounded-2xl bg-purple-50 text-brand-primary text-xs font-black">Przejdź do rozliczeń</button><button onClick={()=>{setActiveTab('integrations');setTimeout(checkIntegrations,50)}} className="w-full py-3.5 rounded-2xl bg-slate-50 text-slate-700 text-xs font-black">Sprawdź integracje</button></div></div></div></section>}
 
-      const metrics = useMemo(() => {
-        const activeTuts = tutors.filter(t => t.status === 'active').length;
-        let revenue = 0; let toPayout = 0;
-        finances.forEach(f => {
-          revenue += Number(f.student_price || 70); 
-          const l = lessons.find(lx => lx.id === f.lesson_id);
-          if (l && l.status === 'completed' && !f.payout_paid) {
-            toPayout += Number(f.tutor_rate || 35);
-          }
-        });
-        return { activeTuts, revenue, toPayout };
-      }, [lessons, tutors, finances]);
+      {activeTab==='lessons'&&<section className="space-y-5"><div className="card p-5 flex flex-col lg:flex-row gap-3 lg:items-center"><input className="soft-input lg:max-w-md" placeholder="Szukaj ucznia, tutora, przedmiotu..." value={lessonSearch} onChange={e=>setLessonSearch(e.target.value)}/><div className="flex gap-2 flex-wrap">{['all','scheduled','completed','cancelled','no_show'].map(s=><button key={s} onClick={()=>setLessonFilter(s)} className={`px-3 py-2 rounded-xl text-xs font-black border ${lessonFilter===s?'bg-purple-100 text-brand-primary border-purple-200':'bg-white text-slate-500'}`}>{s==='all'?'Wszystkie':s}</button>)}</div></div><div className="card overflow-hidden"><div className="hidden md:grid grid-cols-[110px_1fr_1fr_1fr_120px_90px] gap-3 px-5 py-3 text-[10px] uppercase font-black text-slate-400 border-b"><span>Termin</span><span>Uczeń</span><span>Tutor</span><span>Przedmiot</span><span>Status</span><span>Akcje</span></div>{filteredLessons.map(l=>{const t=tutors.find(x=>x.id===l.tutor_id);return <div key={l.id} className="grid md:grid-cols-[110px_1fr_1fr_1fr_120px_90px] gap-3 items-center px-5 py-4 border-b last:border-0 hover:bg-purple-50/40"><div className="text-xs font-black">{plDate(l.lesson_date)}<div className="text-brand-primary">{l.time_start}</div></div><div className="text-sm font-bold">{l.student_name}<div className="text-[10px] text-slate-400">{l.student_email||''}</div></div><div className="text-sm">{t?.name||'—'}</div><div className="text-sm">{l.subject}<div className="text-[10px] text-slate-400">{l.level||'—'}</div></div><span className={`w-fit text-[9px] font-black uppercase px-2 py-1 rounded-full ${statusBadge(l.status)}`}>{l.status}</span><button onClick={()=>setSelectedLesson(l)} className="text-xs font-black text-brand-primary">Szczegóły</button></div>})}{!filteredLessons.length&&<div className="p-12 text-center text-slate-400 text-sm">Brak lekcji dla wybranych filtrów.</div>}</div></section>}
 
-      const payoutGroups = useMemo(() => {
-        const groups = {}; 
-        finances.forEach(f => {
-          const l = lessons.find(lx => lx.id === f.lesson_id);
-          if (l && l.status === 'completed' && !f.payout_paid) {
-            const tut = tutors.find(t => t.id === l.tutor_id);
-            if (!tut) return;
+      {activeTab==='tutors'&&<section className="space-y-5"><div className="card p-5 flex justify-between items-center"><div><h2 className="font-black text-xl">Zespół EduSHOT</h2><p className="text-xs text-slate-400 mt-1">Zarządzaj profilami, dostępnością i rozliczeniami.</p></div><button onClick={()=>{setEditTutorData(null);setAddTutorModal(true)}} className="gradient-cta text-white px-5 py-3 rounded-2xl text-xs font-black">+ Dodaj korepetytora</button></div><div className="grid md:grid-cols-2 xl:grid-cols-3 gap-4">{tutors.map(t=>{const cnt=lessons.filter(l=>l.tutor_id===t.id).length;return <div key={t.id} className="card p-5"><div className="flex gap-3 items-center"><div className="w-12 h-12 rounded-2xl bg-purple-100 text-brand-primary grid place-items-center font-black">{t.name?.[0]||'T'}</div><div className="min-w-0"><div className="font-black truncate">{t.name}</div><div className="text-[11px] text-slate-400 truncate">{t.email}</div></div><span className={`ml-auto text-[9px] font-black px-2 py-1 rounded-full ${t.status==='active'?'bg-emerald-100 text-emerald-700':'bg-slate-100 text-slate-500'}`}>{t.status}</span></div><div className="grid grid-cols-2 gap-2 my-4"><div className="bg-slate-50 rounded-xl p-3"><div className="text-[9px] uppercase font-black text-slate-400">Lekcje</div><div className="font-black">{cnt}</div></div><div className="bg-slate-50 rounded-xl p-3"><div className="text-[9px] uppercase font-black text-slate-400">Cal.com</div><div className="text-xs font-black text-brand-primary truncate">{t.cal_slug||'Brak'}</div></div></div><div className="flex gap-2"><button onClick={()=>{setSelectedTutor(t);setTutorDetailTab('summary')}} className="flex-1 py-2.5 rounded-xl bg-purple-50 text-brand-primary text-xs font-black">Podgląd</button><button onClick={()=>{setEditTutorData(t);setAddTutorModal(true)}} className="px-3 py-2.5 rounded-xl bg-slate-50 text-xs font-black">Edytuj</button>{t.status==='active'&&<button onClick={()=>deactivateTutor(t)} className="px-3 py-2.5 rounded-xl bg-rose-50 text-rose-600 text-xs font-black">Dezaktywuj</button>}</div></div>})}{!tutors.length&&<div className="card p-12 text-center text-slate-400">Brak korepetytorów.</div>}</div></section>}
 
-            const monthKey = l.lesson_date ? l.lesson_date.substring(0, 7) : '0000-00'; 
-            const key = `${tut.id}_${monthKey}`;
+      {activeTab==='students'&&<section className="card overflow-hidden"><div className="p-5 border-b"><h2 className="font-black text-xl">Uczniowie</h2><p className="text-xs text-slate-400 mt-1">Dane z tabeli students lub automatycznie wyprowadzone z lekcji.</p></div>{derivedStudents.map(s=>{const sl=lessons.filter(l=>(s.id&&l.student_id===s.id)||(!s.auth_user_id&&(l.student_email===s.email||l.student_name===s.name)));return <div key={s.id||s.email||s.name} className="p-5 border-b last:border-0 flex justify-between gap-4"><div><div className="font-black text-sm">{s.name||s.student_name||'Uczeń'}</div><div className="text-xs text-slate-400">{s.email||'Brak e-maila'}</div></div><div className="text-right"><div className="font-black">{sl.length}</div><div className="text-[9px] uppercase text-slate-400 font-black">lekcji</div></div></div>})}{!derivedStudents.length&&<div className="p-12 text-center text-slate-400">Brak uczniów.</div>}</section>}
 
-            if (!groups[key]) groups[key] = { tutor: tut, monthKey: monthKey, monthName: formatMonthYear(l.lesson_date), financeIds: [], totalSum: 0, lessonsCount: 0 };
-            
-            groups[key].financeIds.push(f.lesson_id);
-            groups[key].totalSum += Number(f.tutor_rate || 35);
-            groups[key].lessonsCount++;
-          }
-        });
-        return Object.values(groups).sort((a,b) => {
-          if(a.monthKey !== b.monthKey) return a.monthKey.localeCompare(b.monthKey);
-          return a.tutor.name.localeCompare(b.tutor.name);
-        });
-      }, [lessons, tutors, finances]);
+      {activeTab==='payouts'&&<section className="space-y-5"><div className="grid sm:grid-cols-3 gap-3"><Stat label="Do wypłaty" value={money(metrics.toPay)} accent/><Stat label="Okresów w historii" value={settlementGroups.length}/><Stat label="Tutorów" value={tutors.length}/></div><div className="space-y-4">{tutors.map(t=>{const groups=settlementGroups.filter(g=>g.tutor.id===t.id).slice(0,12);if(!groups.length)return null;return <div className="card p-5" key={t.id}><div className="flex items-center justify-between mb-4"><button onClick={()=>{setSelectedTutor(t);setTutorDetailTab('payouts')}} className="text-left"><div className="font-black text-lg">{t.name}</div><div className="text-xs text-slate-400">Historia ostatnich 12 miesięcy</div></button><span className="text-xs font-black text-brand-primary">{money(groups.reduce((s,g)=>s+g.amount,0))}</span></div><div className="space-y-2">{groups.map(g=>{const st=monthStatus(g.monthKey,g.allPaid);return <div key={g.key} className="flex flex-col sm:flex-row sm:items-center gap-3 justify-between p-3.5 bg-slate-50 rounded-2xl"><div><div className="font-black text-sm">{monthLabel(g.monthKey)}</div><div className="text-[10px] text-slate-400">{g.items.length} lekcji • {g.minutes?`${(g.minutes/60).toFixed(1)} h`:'czas z lekcji'}</div></div><div className="sm:text-right"><div className="font-black">{money(g.amount)}</div><div className={`text-[9px] font-black ${st==='PAID'?'text-emerald-600':st==='OVERDUE'?'text-rose-600':'text-brand-primary'}`}>{st}</div></div>{!g.allPaid&&g.monthKey!==currentMonthKey()&&<button onClick={()=>markGroupPaid(g)} className="px-3 py-2 rounded-xl gradient-cta text-white text-[10px] font-black">Oznacz wypłacone</button>}</div>})}</div></div>})}{!settlementGroups.length&&<div className="card p-12 text-center"><div className="font-black">Brak zakończonych lekcji do rozliczeń.</div></div>}</div></section>}
 
-      if (loadingAuth) return <div className="min-h-screen flex items-center justify-center bg-[#FAF8FE]"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"></div></div>;
+      {activeTab==='finance'&&<section className="space-y-5"><div className="card p-5 flex flex-col sm:flex-row gap-3 sm:items-end"><div><label className="block text-[10px] uppercase font-black text-slate-400 mb-1">Miesiąc</label><input type="month" className="soft-input" value={financeMonth} onChange={e=>setFinanceMonth(e.target.value)}/></div></div><div className="grid grid-cols-2 lg:grid-cols-4 gap-3"><Stat label="Przychód" value={money(monthFinances.revenue)}/><Stat label="Koszt tutorów" value={money(monthFinances.cost)}/><Stat label="Opłaty" value={money(monthFinances.fee)}/><Stat label="Marża" value={money(monthFinances.margin)} accent/></div><div className="card overflow-hidden"><div className="p-5 border-b font-black">Lekcje finansowe — {monthLabel(financeMonth)}</div>{monthFinances.rows.map(x=><div key={x.lesson.id} className="grid sm:grid-cols-5 gap-3 p-4 border-b last:border-0 text-xs"><div className="font-bold">{x.lesson.student_name}<div className="text-slate-400">{plDate(x.lesson.lesson_date)}</div></div><div>{x.tutor?.name||'—'}</div><div>Sprzedaż: <b>{money(x.finance.student_price)}</b></div><div>Koszt: <b>{money(x.finance.tutor_rate)}</b></div><div>Marża: <b>{money(Number(x.finance.student_price||0)-Number(x.finance.tutor_rate||0)-Number(x.finance.payment_fee||0))}</b></div></div>)}{!monthFinances.rows.length&&<div className="p-12 text-center text-slate-400">Brak danych finansowych w tym miesiącu.</div>}</div></section>}
 
-      if (!session) {
-        return (
-          <div className="min-h-screen bg-[#FAF8FE] flex items-center justify-center p-4">
-            <div className="w-full max-w-md bg-white rounded-[32px] p-10 shadow-card text-center">
-              <div className="w-12 h-12 rounded-2xl bg-brand-primary text-white flex items-center justify-center font-black text-xl mx-auto mb-4">⚡</div>
-              <h1 className="text-3xl font-black text-slate-900 tracking-tight mb-2">Centrala EduSHOT</h1>
-              <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-8">Logowanie Administratora</p>
-              {authError && <div className="p-3 bg-rose-50 text-rose-600 text-xs font-bold rounded-xl mb-4">{authError}</div>}
-              <form onSubmit={handleLogin} className="space-y-4">
-                <input type="email" required value={loginEmail} onChange={e=>setLoginEmail(e.target.value)} placeholder="E-mail admina" className="w-full p-4 rounded-2xl border border-slate-200 text-sm outline-none" />
-                <input type="password" required value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} placeholder="Hasło" className="w-full p-4 rounded-2xl border border-slate-200 text-sm outline-none" />
-                <button type="submit" className="w-full py-4 rounded-2xl gradient-cta text-white font-black text-sm mt-2">Zaloguj się</button>
-              </form>
-            </div>
-          </div>
-        );
-      }
+      {activeTab==='integrations'&&<section className="space-y-5"><div className="flex justify-between"><div><h2 className="font-black text-xl">Integracje</h2><p className="text-xs text-slate-400 mt-1">Stan połączeń bez ujawniania sekretów.</p></div><button onClick={checkIntegrations} className="px-4 py-2.5 rounded-xl bg-purple-50 text-brand-primary text-xs font-black">Sprawdź status</button></div><div className="grid md:grid-cols-3 gap-4">{[['Supabase','supabase','database'],['Admin API','adminApi','shield-check'],['Cal.com Scheduler','scheduler','calendar-sync']].map(([name,key,icon])=><div className="card p-5" key={key}><div className="flex justify-between"><div className="w-10 h-10 rounded-xl bg-purple-50 text-brand-primary grid place-items-center"><Icon name={icon}/></div><span className={`text-[10px] font-black px-2 py-1 rounded-full ${integrationHealth[key]==='ok'?'bg-emerald-100 text-emerald-700':integrationHealth[key]==='checking'?'bg-amber-100 text-amber-700':'bg-slate-100 text-slate-500'}`}>{integrationHealth[key]}</span></div><div className="font-black mt-4">{name}</div><div className="text-xs text-slate-400 mt-1">{key==='scheduler'?'Dostępność i scheduling tutorów':key==='adminApi'?'Bezpieczne akcje administratora':'Auth, baza i Realtime'}</div></div>)}</div><div className="card p-5"><h3 className="font-black mb-3">Stan tabel</h3><div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">{Object.entries(tableHealth).map(([k,v])=><div key={k} className="p-3 rounded-xl bg-slate-50 text-xs"><b>{k}</b><div className={v==='ok'?'text-emerald-600':'text-rose-600'}>{v==='ok'?'OK':v}</div></div>)}</div></div></section>}
 
-      const NavItem = ({ id, label, icon }) => (
-        <button onClick={() => setActiveTab(id)} className={`w-full flex items-center gap-3.5 px-4 py-3.5 rounded-2xl font-bold text-sm transition-all ${activeTab === id ? 'sidebar-active' : 'text-slate-500 hover:bg-purple-50 hover:text-slate-800'}`}>
-          <Icon name={icon} size={18} /><span>{label}</span>
-        </button>
-      );
+      {activeTab==='settings'&&<section className="max-w-3xl"><form onSubmit={saveSettings} className="card p-6 space-y-5"><h2 className="font-black text-xl">Ustawienia operacyjne</h2><div className="grid sm:grid-cols-2 gap-4"><label className="text-xs font-bold">Strefa czasowa<input className="soft-input mt-2" value={settings.timezone} onChange={e=>setSettings({...settings,timezone:e.target.value})}/></label><label className="text-xs font-bold">Minimalny czas przed rezerwacją (min)<input type="number" className="soft-input mt-2" value={settings.minNotice} onChange={e=>setSettings({...settings,minNotice:Number(e.target.value)})}/></label><label className="text-xs font-bold">Anulowanie najpóźniej (h)<input type="number" className="soft-input mt-2" value={settings.cancelHours} onChange={e=>setSettings({...settings,cancelHours:Number(e.target.value)})}/></label><label className="text-xs font-bold">Przełożenie najpóźniej (h)<input type="number" className="soft-input mt-2" value={settings.rescheduleHours} onChange={e=>setSettings({...settings,rescheduleHours:Number(e.target.value)})}/></label><label className="text-xs font-bold">Przypomnienie przed lekcją (min)<input type="number" className="soft-input mt-2" value={settings.lessonReminder} onChange={e=>setSettings({...settings,lessonReminder:Number(e.target.value)})}/></label></div><div className="text-[11px] text-amber-700 bg-amber-50 p-3 rounded-xl">Te ustawienia są obecnie zapisywane lokalnie w panelu. Gdy dodasz tabelę ustawień systemowych, można przenieść je do Supabase bez zmiany interfejsu.</div><button className="gradient-cta px-6 py-3 rounded-xl text-white text-xs font-black">Zapisz ustawienia</button></form></section>}
+    </main>
 
-      return (
-        <div className="min-h-screen bg-[#FAF8FE] flex flex-col lg:flex-row">
-          {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+    {selectedLesson&&<div className="fixed inset-0 z-[80] bg-slate-950/55 backdrop-blur-sm p-4 flex items-center justify-center" onClick={()=>setSelectedLesson(null)}><div className="card w-full max-w-xl p-6" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-5"><div><div className="text-[10px] uppercase font-black text-brand-primary">Szczegóły lekcji</div><h3 className="text-xl font-black mt-1">{selectedLesson.student_name}</h3></div><button onClick={()=>setSelectedLesson(null)}><Icon name="x"/></button></div><div className="grid sm:grid-cols-2 gap-3 text-sm"><div className="bg-slate-50 p-3 rounded-xl"><b>Termin</b><div>{plDate(selectedLesson.lesson_date)} • {selectedLesson.time_start}–{selectedLesson.time_end}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Przedmiot</b><div>{selectedLesson.subject} • {selectedLesson.level||'—'}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Tutor</b><div>{tutors.find(t=>t.id===selectedLesson.tutor_id)?.name||'—'}</div></div><div className="bg-slate-50 p-3 rounded-xl"><b>Status</b><div>{selectedLesson.status}</div></div></div>{selectedLesson.student_message&&<div className="mt-3 p-3 rounded-xl bg-purple-50 text-sm">{selectedLesson.student_message}</div>}<div className="mt-5 flex flex-wrap gap-2">{selectedLesson.meet_url&&<a target="_blank" href={selectedLesson.meet_url} className="gradient-cta text-white px-4 py-2.5 rounded-xl text-xs font-black">Otwórz spotkanie</a>}<button onClick={()=>updateLessonStatus(selectedLesson.id,'completed')} className="px-4 py-2.5 rounded-xl bg-emerald-50 text-emerald-700 text-xs font-black">Oznacz zakończoną</button><button onClick={()=>updateLessonStatus(selectedLesson.id,'cancelled')} className="px-4 py-2.5 rounded-xl bg-rose-50 text-rose-700 text-xs font-black">Anuluj w bazie</button></div></div></div>}
 
-          <aside className="hidden lg:flex w-[280px] bg-white border-r border-purple-100 p-6 flex-col justify-between fixed inset-y-0 z-40">
-            <div>
-              <div className="flex items-center gap-2 mb-10 px-2 cursor-pointer" onClick={()=>setActiveTab('dashboard')}>
-                <div className="w-8 h-8 bg-brand-primary text-white rounded-xl flex items-center justify-center font-black">⚡</div>
-                <h1 className="text-xl font-black text-slate-900 tracking-tight">EduSHOT. <span className="text-[10px] bg-purple-100 text-brand-primary px-2 py-0.5 rounded-full relative -top-1">ADMIN</span></h1>
-              </div>
-              <nav className="space-y-1.5">
-                <NavItem id="dashboard" label="Dashboard" icon="layout-dashboard" />
-                <NavItem id="payouts" label="Rozliczenia co 10." icon="credit-card" />
-                <NavItem id="tutors" label="Korepetytorzy" icon="users" />
-              </nav>
-            </div>
-            <div className="pt-6 border-t border-slate-100 flex items-center justify-between px-2">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-slate-900 text-white font-black flex items-center justify-center text-lg">A</div>
-                <div className="overflow-hidden">
-                  <span className="block text-sm font-black text-slate-900 truncate">Administrator</span>
-                  <span className="block text-[10px] font-bold text-slate-400">{adminEmail}</span>
-                </div>
-              </div>
-              <button onClick={()=>supabase.auth.signOut()} className="p-2 text-slate-400 hover:text-rose-500 transition"><Icon name="log-out" size={18}/></button>
-            </div>
-          </aside>
+    {selectedTutor&&<div className="fixed inset-0 z-[80] bg-slate-950/55 backdrop-blur-sm p-3 sm:p-5 flex items-center justify-center" onClick={()=>setSelectedTutor(null)}><div className="card w-full max-w-5xl max-h-[90vh] overflow-auto p-5 sm:p-7" onClick={e=>e.stopPropagation()}><div className="flex justify-between gap-4"><div className="flex gap-3 items-center"><div className="w-12 h-12 rounded-2xl bg-purple-100 text-brand-primary grid place-items-center font-black text-xl">{selectedTutor.name?.[0]}</div><div><h3 className="font-black text-xl">{selectedTutor.name}</h3><div className="text-xs text-slate-400">{selectedTutor.email}</div></div></div><button onClick={()=>setSelectedTutor(null)}><Icon name="x"/></button></div><div className="flex gap-2 overflow-auto mt-5 pb-1">{[['summary','Podsumowanie'],['lessons','Lekcje'],['availability','Dostępność'],['payouts','Rozliczenia']].map(([id,label])=><button key={id} onClick={()=>setTutorDetailTab(id)} className={`tab-btn ${tutorDetailTab===id?'active':''} shrink-0 px-3 py-2 rounded-xl border text-xs font-black`}>{label}</button>)}</div>{tutorDetailTab==='summary'&&<div className="grid sm:grid-cols-3 gap-3 mt-5"><div className="bg-slate-50 p-4 rounded-2xl"><div className="text-[9px] uppercase text-slate-400 font-black">Status</div><div className="font-black">{selectedTutor.status}</div></div><div className="bg-slate-50 p-4 rounded-2xl"><div className="text-[9px] uppercase text-slate-400 font-black">Slug Cal.com</div><div className="font-black text-brand-primary">{selectedTutor.cal_slug||'—'}</div></div><div className="bg-slate-50 p-4 rounded-2xl"><div className="text-[9px] uppercase text-slate-400 font-black">IBAN</div><div className="font-mono text-xs">{selectedTutor.iban||'—'}</div></div></div>}{tutorDetailTab==='lessons'&&<div className="mt-5 space-y-2">{lessons.filter(l=>l.tutor_id===selectedTutor.id).map(l=><button key={l.id} onClick={()=>{setSelectedTutor(null);setSelectedLesson(l)}} className="w-full p-3 rounded-xl bg-slate-50 flex justify-between text-left text-xs"><span><b>{plDate(l.lesson_date)} {l.time_start}</b> — {l.student_name}</span><span>{l.status}</span></button>)}</div>}{tutorDetailTab==='availability'&&<div className="mt-5"><div className="text-sm font-black mb-3">Grafik zapisany w bazie/cache</div>{availability.filter(a=>a.tutor_id===selectedTutor.id).length?availability.filter(a=>a.tutor_id===selectedTutor.id).map(a=><div key={a.id} className="p-3 bg-slate-50 rounded-xl mb-2 text-xs">Dzień {a.day_of_week}: <b>{a.start_time}–{a.end_time}</b></div>):<div className="p-5 bg-slate-50 rounded-xl text-xs text-slate-400">Brak rekordów tutor_availability. Aktualny scheduling może być przechowywany w Cal.com / schedule_data.</div>}</div>}{tutorDetailTab==='payouts'&&<div className="mt-5 space-y-2">{settlementGroups.filter(g=>g.tutor.id===selectedTutor.id).slice(0,12).map(g=><div key={g.key} className="p-4 bg-slate-50 rounded-2xl flex justify-between"><div><b>{monthLabel(g.monthKey)}</b><div className="text-[10px] text-slate-400">{g.items.length} lekcji</div></div><div className="text-right"><b>{money(g.amount)}</b><div className="text-[10px] text-brand-primary font-black">{monthStatus(g.monthKey,g.allPaid)}</div></div></div>)}</div>}</div></div>}
 
-          <main className="flex-1 lg:pl-[280px] p-4 sm:p-8 w-full">
-            <header className="flex justify-between items-center mb-8 bg-white/50 backdrop-blur-sm p-4 rounded-3xl border border-purple-100 shadow-sm">
-              <h2 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight capitalize px-2">{activeTab}</h2>
-              <button onClick={loadData} className="p-2.5 rounded-xl bg-white border border-slate-200 text-slate-500 hover:text-brand-primary shadow-sm"><Icon name="refresh-cw" size={16}/></button>
-            </header>
-
-            {activeTab === 'dashboard' && (
-              <div className="space-y-8 animate-fade-in">
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                  <div className="bg-white p-6 rounded-3xl shadow-card border border-purple-50">
-                    <span className="block text-[10px] font-black text-slate-400 uppercase mb-1">Tutorzy (Aktywni)</span>
-                    <span className="block text-3xl font-black text-slate-900">{metrics.activeTuts}</span>
-                  </div>
-                  <div className="bg-white p-6 rounded-3xl shadow-card border border-purple-50">
-                    <span className="block text-[10px] font-black text-slate-400 uppercase mb-1">Przychód ogółem</span>
-                    <span className="block text-3xl font-black text-slate-900 font-mono">{metrics.revenue} zł</span>
-                  </div>
-                  <div className="bg-white p-6 rounded-3xl shadow-card border border-brand-primary/30 bg-brand-50">
-                    <span className="block text-[10px] font-black text-brand-primary uppercase mb-1">Do wypłaty tutorom</span>
-                    <span className="block text-3xl font-black text-brand-primary font-mono">{metrics.toPayout} zł</span>
-                  </div>
-                </div>
-                
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                  <div className="lg:col-span-2 space-y-4">
-                    <h3 className="font-black text-lg text-slate-900 px-2">Zarejestrowane lekcje</h3>
-                    <div className="bg-white rounded-3xl p-6 shadow-card border border-purple-50 space-y-4">
-                      {lessons.slice(0,5).map(l => {
-                        const tut = tutors.find(t => t.id === l.tutor_id);
-                        const fin = finances.find(f => f.lesson_id === l.id);
-                        return (
-                          <div key={l.id} className="flex justify-between items-center p-4 bg-slate-50 rounded-2xl">
-                            <div className="flex items-center gap-4">
-                              <div className="w-12 h-12 bg-white rounded-xl shadow-sm flex flex-col items-center justify-center font-mono text-brand-primary text-xs font-black">
-                                {l.time_start}
-                              </div>
-                              <div>
-                                <span className="font-black text-sm text-slate-900 block">{l.student_name}</span>
-                                <span className="text-xs text-slate-500">{l.subject} • Tutor: {tut?.name}</span>
-                              </div>
-                            </div>
-                            <div className="text-right">
-                              <span className="block font-black text-xs text-slate-900 font-mono mb-1">Koszt: {fin?.tutor_rate || 35} zł</span>
-                              <span className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${l.status==='completed'?'bg-emerald-100 text-emerald-700':'bg-purple-100 text-brand-700'}`}>{l.status}</span>
-                            </div>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {activeTab === 'payouts' && (
-              <div className="space-y-6 animate-fade-in">
-                {payoutGroups.length === 0 ? (
-                  <div className="bg-white rounded-3xl p-12 text-center shadow-sm">
-                    <h3 className="text-xl font-black text-slate-900">Wszystko rozliczone na czysto!</h3>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {payoutGroups.map(group => (
-                      <div key={`${group.tutor.id}_${group.monthKey}`} className="bg-white rounded-3xl p-6 shadow-card border border-purple-100 flex justify-between items-center">
-                        <div className="flex items-center gap-4">
-                          <div className="w-14 h-14 bg-gradient-to-tr from-brand-primary to-brand-magenta text-white rounded-2xl flex items-center justify-center font-black text-xl">{group.tutor.name[0]}</div>
-                          <div>
-                            <h3 className="font-black text-lg text-slate-900">{group.tutor.name} <span className="text-brand-primary text-xs bg-purple-50 px-2 py-0.5 rounded-full">{group.monthName}</span></h3>
-                            <p className="text-xs text-slate-500 mt-1">Należność: <strong className="font-mono text-slate-900">{group.totalSum} zł</strong> ({group.lessonsCount} lekcji)</p>
-                            <p className="text-xs text-slate-500">IBAN: <span className="font-mono">{group.tutor.iban || 'Brak'}</span></p>
-                          </div>
-                        </div>
-                        <button onClick={()=>handleMarkPaid(group.financeIds)} className="px-6 py-3 rounded-xl gradient-cta text-white font-black text-xs shadow-lg flex items-center gap-2">
-                          <Icon name="check" size={16}/> Oznacz wypłacone
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {activeTab === 'tutors' && (
-              <div className="space-y-6 animate-fade-in">
-                <div className="flex justify-between items-center bg-white p-4 rounded-3xl shadow-sm border border-purple-50">
-                  <h2 className="text-xl font-black text-slate-900 px-2">Aktywny Zespół ({tutors.filter(t=>t.status==='active').length})</h2>
-                  <button onClick={()=>{setEditTutorData(null); setAddTutorModal(true);}} className="px-6 py-3 rounded-full gradient-cta text-white font-black text-xs shadow-md">+ Dodaj Korepetytora</button>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                  {tutors.filter(t=>t.status === 'active').map(t => (
-                    <div key={t.id} className="bg-white rounded-3xl p-6 shadow-card border border-purple-50 hover:border-purple-200 transition">
-                      <div className="flex items-center gap-4 mb-4">
-                        <div className="w-14 h-14 rounded-2xl bg-brand-primary text-white flex items-center justify-center text-xl font-black">{t.name[0]}</div>
-                        <div>
-                          <h3 className="font-black text-slate-900 text-lg">{t.name}</h3>
-                          <span className="text-xs font-bold text-slate-400">{t.email}</span>
-                        </div>
-                      </div>
-                      <div className="p-3 bg-slate-50 rounded-xl mb-4 border border-slate-100 text-xs space-y-1">
-                        <div className="flex justify-between"><span className="text-slate-400">Slug Cal.com:</span><span className="font-mono font-bold text-brand-primary">{t.cal_slug || 'Brak'}</span></div>
-                        <div className="flex justify-between"><span className="text-slate-400">IBAN:</span><span className="font-mono">{t.iban || 'Brak'}</span></div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button onClick={()=>{setEditTutorData(t); setAddTutorModal(true);}} className="flex-1 py-2.5 rounded-xl bg-purple-50 text-brand-primary font-black text-xs hover:bg-purple-100 transition">Edytuj profil</button>
-                        <button onClick={()=>handleDeactivateTutor(t.id, t.name)} className="py-2.5 px-4 rounded-xl bg-rose-50 text-rose-600 hover:bg-rose-100 font-bold text-xs transition">Zarchiwizuj (Usuń z listy)</button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </main>
-
-          {/* DODAJ / EDYTUJ TUTORA MODAL */}
-          {addTutorModal && (
-            <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in" onClick={()=>setAddTutorModal(false)}>
-              <div className="bg-white rounded-[32px] max-w-lg w-full p-8 shadow-2xl relative" onClick={e=>e.stopPropagation()}>
-                <h3 className="text-2xl font-black text-slate-900 mb-6">{editTutorData ? 'Edytuj Profil Korepetytora' : 'Dodaj Nowego Korepetytora'}</h3>
-                <form onSubmit={handleSaveTutor} className="space-y-4 text-sm font-bold">
-                  <div>
-                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Imię i Nazwisko</label>
-                    <input type="text" name="name" required defaultValue={editTutorData?.name} placeholder="np. Jan Kowalski" className="w-full p-3 rounded-xl border outline-none focus:border-brand-primary"/>
-                  </div>
-                  <div>
-                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Adres e-mail (Login)</label>
-                    <input type="email" name="email" required defaultValue={editTutorData?.email} disabled={!!editTutorData} placeholder="jan@edushot.pl" className="w-full p-3 rounded-xl border outline-none disabled:bg-slate-50 disabled:text-slate-400"/>
-                  </div>
-                  <div>
-                    <label className="block text-slate-500 text-[10px] uppercase mb-1">IBAN (Wypłaty 10-tego)</label>
-                    <input type="text" name="iban" defaultValue={editTutorData?.iban} placeholder="PL..." className="w-full p-3 rounded-xl border font-mono text-xs"/>
-                  </div>
-                  <div>
-                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Cal.com Slug</label>
-                    <input type="text" name="slug" required defaultValue={editTutorData?.cal_slug} placeholder="np. jan-kowalski" className="w-full p-3 rounded-xl border font-mono text-xs"/>
-                  </div>
-                  <div className="pt-4 flex gap-3">
-                    <button type="button" onClick={()=>setAddTutorModal(false)} className="flex-1 py-3.5 rounded-xl bg-slate-100 text-slate-700 hover:bg-slate-200 transition">Anuluj</button>
-                    <button type="submit" disabled={isActionLoading} className="flex-1 py-3.5 rounded-xl gradient-cta text-white shadow-glow">{isActionLoading ? 'Czekaj...' : (editTutorData ? 'Zapisz zmiany' : 'Utwórz konto')}</button>
-                  </div>
-                </form>
-              </div>
-            </div>
-          )}
-        </div>
-      );
-    }
-    ReactDOM.createRoot(document.getElementById('root')).render(<AdminApp />);
-  </script>
+    {addTutorModal&&<div className="fixed inset-0 z-[90] bg-slate-950/60 backdrop-blur-sm p-4 flex items-center justify-center" onClick={()=>setAddTutorModal(false)}><div className="card w-full max-w-lg p-6" onClick={e=>e.stopPropagation()}><div className="flex justify-between mb-5"><h3 className="font-black text-xl">{editTutorData?'Edytuj korepetytora':'Dodaj korepetytora'}</h3><button onClick={()=>setAddTutorModal(false)}><Icon name="x"/></button></div><form onSubmit={handleSaveTutor} className="space-y-4"><label className="text-[10px] uppercase font-black text-slate-400">Imię i nazwisko<input name="name" required defaultValue={editTutorData?.name||''} className="soft-input mt-1"/></label><label className="text-[10px] uppercase font-black text-slate-400">E-mail<input name="email" type="email" required disabled={!!editTutorData} defaultValue={editTutorData?.email||''} className="soft-input mt-1 disabled:bg-slate-50"/></label><label className="text-[10px] uppercase font-black text-slate-400">IBAN<input name="iban" defaultValue={editTutorData?.iban||''} className="soft-input mt-1 font-mono"/></label><label className="text-[10px] uppercase font-black text-slate-400">Cal.com slug<input name="slug" required defaultValue={editTutorData?.cal_slug||''} className="soft-input mt-1"/></label><div className="flex gap-3 pt-2"><button type="button" onClick={()=>setAddTutorModal(false)} className="flex-1 py-3 rounded-xl bg-slate-100 font-black text-xs">Anuluj</button><button disabled={isActionLoading} className="flex-1 py-3 rounded-xl gradient-cta text-white font-black text-xs">{isActionLoading?'Zapisywanie...':editTutorData?'Zapisz zmiany':'Utwórz konto'}</button></div></form></div></div>}
+  </div>;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<AdminApp/>);
+</script>
 </body>
 </html>
