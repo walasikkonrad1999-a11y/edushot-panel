@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EduSHOT — Panel Korepetytora</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { sans: ['"Plus Jakarta Sans"', 'sans-serif'] }, colors: { brand: { primary: '#8B3DFF', magenta: '#D946EF' } } } } }
+  </script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background: #FAF8FE; color: #0F172A; min-height: 100vh; }
+    .gradient-btn { background: linear-gradient(135deg, #8B3DFF 0%, #D946EF 100%); transition: transform 0.2s; }
+    .gradient-btn:hover { transform: translateY(-1px); box-shadow: 0 10px 25px rgba(139, 61, 255, 0.4); }
+  </style>
+</head>
+<body class="antialiased">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    
+    // --- USTAWIENIA PRODUKCYJNE (PODMIEŃ) ---
+    const SUPABASE_URL = "https://twoj-projekt.supabase.co"; 
+    const SUPABASE_ANON_KEY = "twoj-klucz-anon"; 
+    const WORKER_URL = "https://twoj-worker.workers.dev"; 
+    
+    const getWorkerApi = (endpoint) => `${WORKER_URL.replace(/\/+$/, '')}${endpoint}`;
+    const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+    const Icon = ({ name, size = 18 }) => {
+      const ref = useRef(null);
+      useEffect(() => { if (ref.current && window.lucide) { ref.current.innerHTML = `<i data-lucide="${name}"></i>`; window.lucide.createIcons({ root: ref.current, attrs: { width: size, height: size } }); } }, [name, size]);
+      return <span ref={ref} className="inline-flex items-center justify-center shrink-0" />;
+    };
+
+    const Toast = ({ msg, type, onClose }) => {
+      useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
+      return (
+        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold flex items-center gap-3 border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-900 text-white border-slate-700'}`}>
+          <span className={type==='error'?'text-rose-400':'text-emerald-400'}>{type==='error'?'✕':'✓'}</span><span>{msg}</span>
+        </div>
+      );
+    };
+
+    function TutorApp() {
+      const [session, setSession] = useState(null);
+      const [tutorProfile, setTutorProfile] = useState(null);
+      const [loadingAuth, setLoadingAuth] = useState(true);
+      const [activeTab, setActiveTab] = useState('dashboard');
+      
+      const [lessons, setLessons] = useState([]);
+      const [selectedLesson, setSelectedLesson] = useState(null);
+      
+      const [availability, setAvailability] = useState([]);
+      const [toast, setToast] = useState(null);
+
+      const showToast = (msg, type='success') => setToast({msg, type});
+
+      useEffect(() => {
+        if(!supabase) return;
+        supabase.auth.getSession().then(({ data: { session } }) => {
+          if (session) verifyTutor(session); else setLoadingAuth(false);
+        });
+        supabase.auth.onAuthStateChange((_e, session) => {
+          if (!session) { setSession(null); setTutorProfile(null); setLoadingAuth(false); }
+        });
+      }, []);
+
+      const verifyTutor = async (activeSession) => {
+        setLoadingAuth(true);
+        const { data } = await supabase.from('tutors').select('*').eq('auth_user_id', activeSession.user.id).single();
+        if (data && data.status === 'active') {
+          setSession(activeSession); setTutorProfile(data);
+          fetchLessons(data.id);
+          
+          supabase.channel('tutor-lessons').on('postgres_changes', { event: '*', schema: 'public', table: 'lessons', filter: `tutor_id=eq.${data.id}` }, () => { fetchLessons(data.id); showToast('Grafik zaktualizowany!', 'info'); }).subscribe();
+        } else {
+          await supabase.auth.signOut();
+        }
+        setLoadingAuth(false);
+      };
+
+      const fetchLessons = async (id) => {
+        const { data } = await supabase.from('lessons').select('*').eq('tutor_id', id).order('lesson_date', { ascending: true });
+        if(data) setLessons(data);
+      };
+
+      const handleLogin = async (e) => {
+        e.preventDefault(); setLoadingAuth(true);
+        const { data, error } = await supabase.auth.signInWithPassword({ email: e.target.email.value, password: e.target.password.value });
+        if (error) { alert('Błąd logowania'); setLoadingAuth(false); }
+        else await verifyTutor(data.session);
+      };
+
+      const handleUpdateLessonStatus = async (lessonId, targetStatus, attendanceType) => {
+        const payload = { status: targetStatus, attendance: attendanceType };
+        const { error } = await supabase.from('lessons').update(payload).eq('id', lessonId);
+        if (!error) {
+          setLessons(prev => prev.map(l => l.id === lessonId ? { ...l, ...payload } : l));
+          setSelectedLesson(null);
+          showToast('Status obecności został zapisany w systemie.');
+        } else {
+          showToast('Błąd aktualizacji', 'error');
+        }
+      };
+
+      const fetchAvailability = async () => {
+        try {
+          const res = await fetch(getWorkerApi('/api/tutor/availability'), { headers: { 'Authorization': `Bearer ${session.access_token}` }});
+          if(res.ok) { const data = await res.json(); setAvailability(data.availability || []); }
+        } catch(e) {}
+      };
+
+      const handleUpdateAvailability = async () => {
+        try {
+          const payload = { timeZone: 'Europe/Warsaw', days: availability };
+          const res = await fetch(getWorkerApi('/api/tutor/availability'), { method: 'PUT', headers: { 'Authorization': `Bearer ${session.access_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          if(res.ok) showToast('Grafik został bezpiecznie zapisany w bazie!'); else showToast('Błąd API.', 'error');
+        } catch(e) { showToast('Błąd połączenia z serwerem.', 'error'); }
+      };
+
+      useEffect(() => { if(activeTab === 'availability' && session) fetchAvailability(); }, [activeTab, session]);
+
+      if (loadingAuth) return <div className="min-h-screen flex items-center justify-center"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"></div></div>;
+
+      if (!session) {
+        return (
+          <div className="min-h-screen flex items-center justify-center px-4">
+            <div className="w-full max-w-md bg-white rounded-[32px] p-10 shadow-2xl border border-purple-100 text-center">
+              <h1 className="text-3xl font-black text-slate-900 mb-2">EduSHOT</h1>
+              <p className="text-xs font-bold text-slate-400 uppercase mb-8">Panel Nauczyciela</p>
+              <form onSubmit={handleLogin} className="space-y-4 text-left">
+                <input type="email" name="email" required placeholder="E-mail" className="w-full px-4 py-3.5 text-sm rounded-2xl border outline-none focus:border-brand-primary" />
+                <input type="password" name="password" required placeholder="Hasło" className="w-full px-4 py-3.5 text-sm rounded-2xl border outline-none focus:border-brand-primary" />
+                <button type="submit" className="w-full py-4 rounded-2xl gradient-btn text-white font-extrabold text-sm shadow-lg">Zaloguj się</button>
+              </form>
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div className="min-h-screen flex flex-col pb-20 md:pb-6">
+          {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+          
+          <header className="sticky top-4 z-40 px-4 sm:px-8 max-w-7xl mx-auto w-full">
+            <div className="bg-white/90 backdrop-blur-md rounded-full px-5 py-3 shadow-lg flex justify-between items-center border border-purple-100">
+              <div className="flex items-center gap-6">
+                <div className="flex items-center gap-2 cursor-pointer" onClick={()=>setActiveTab('dashboard')}>
+                  <div className="w-8 h-8 bg-brand-primary text-white rounded-full flex items-center justify-center font-black">⚡</div>
+                  <span className="text-xl font-black text-slate-900">EduSHOT.</span>
+                </div>
+                <nav className="hidden md:flex gap-2 text-sm font-bold text-slate-600">
+                  <button onClick={()=>setActiveTab('dashboard')} className={`px-4 py-2.5 rounded-full transition ${activeTab==='dashboard'?'bg-purple-100 text-brand-primary':'hover:text-slate-900'}`}>Moje Zajęcia</button>
+                  <button onClick={()=>setActiveTab('availability')} className={`px-4 py-2.5 rounded-full transition ${activeTab==='availability'?'bg-purple-100 text-brand-primary':'hover:text-slate-900'}`}>Dostępność godzin</button>
+                </nav>
+              </div>
+              <button onClick={()=>supabase.auth.signOut()} className="text-slate-400 hover:text-rose-600 font-bold text-xs flex items-center gap-2"><Icon name="log-out" size={16}/> Wyloguj</button>
+            </div>
+          </header>
+
+          <main className="flex-1 max-w-5xl mx-auto w-full px-4 sm:px-8 py-8 space-y-6">
+            {activeTab === 'dashboard' && (
+              <div className="space-y-6">
+                <h2 className="text-3xl font-black text-slate-900">Cześć, {tutorProfile.name.split(' ')[0]}! 👋</h2>
+                <div className="bg-white rounded-3xl p-6 md:p-8 border border-purple-100 shadow-sm space-y-5">
+                  <h3 className="font-black text-lg mb-2">Moje zaplanowane zajęcia</h3>
+                  <div className="space-y-3">
+                    {lessons.sort((a,b)=>new Date(b.lesson_date)-new Date(a.lesson_date)).map(l => (
+                      <div key={l.id} className="p-4 sm:p-5 bg-slate-50 rounded-2xl flex flex-col sm:flex-row justify-between items-center gap-4 border border-slate-100 transition">
+                        <div className="flex items-center gap-4 w-full">
+                          <div className="w-14 h-14 rounded-2xl bg-white flex flex-col items-center justify-center font-mono text-brand-primary shadow-sm border border-slate-100">
+                            <span className="text-xs font-black">{l.time_start}</span>
+                            <span className="text-[10px] font-bold text-slate-400">{l.lesson_date.slice(5)}</span>
+                          </div>
+                          <div>
+                            <strong className="text-sm font-black text-slate-900 block">{l.student_name}</strong>
+                            <span className="text-xs font-bold text-slate-500">{l.subject} • {l.level}</span>
+                            <div className="mt-1">
+                              <span className={`text-[10px] font-black px-2 py-0.5 rounded-full uppercase tracking-wider ${l.status==='completed'?'bg-emerald-100 text-emerald-700':l.status==='cancelled'?'bg-rose-100 text-rose-700':'bg-purple-100 text-brand-primary'}`}>{l.status}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <button onClick={()=>setSelectedLesson(l)} className="w-full sm:w-auto px-6 py-3 rounded-full bg-white border border-purple-200 text-brand-primary font-bold text-xs hover:bg-purple-50 transition shadow-sm">
+                          SZCZEGÓŁY
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'availability' && (
+              <div className="bg-white rounded-3xl p-8 border border-purple-100 shadow-sm space-y-6">
+                <h2 className="text-2xl font-black text-slate-900">Ustaw Grafik</h2>
+                <p className="text-sm text-slate-500">Zaznacz, w jakich godzinach jesteś dostępny. Zapisane dane trafiają bezpiecznie do bazy.</p>
+                <div className="space-y-3">
+                  {availability.length > 0 ? availability.map((d, i) => (
+                    <div key={i} className="flex justify-between items-center p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                      <strong className="capitalize w-32 text-sm">{d.day}</strong>
+                      <div className="flex gap-2">
+                        {d.active ? d.intervals.map((intv, j) => <span key={j} className="bg-white text-brand-primary border border-purple-100 px-3 py-1.5 rounded-full text-xs font-mono font-bold shadow-sm">{intv.start}-{intv.end}</span>) : <span className="text-slate-400 text-xs font-bold">WOLNE</span>}
+                      </div>
+                    </div>
+                  )) : <p className="text-sm text-slate-400 italic">Ładowanie grafiku z serwera...</p>}
+                </div>
+                <button onClick={handleUpdateAvailability} className="w-full py-4 gradient-btn text-white font-black rounded-2xl mt-4 shadow-lg text-sm tracking-wide">ZAPISZ SWÓJ GRAFIK</button>
+              </div>
+            )}
+          </main>
+
+          {/* OSTATECZNY MODAL SZCZEGÓŁÓW Z PRZYCISKAMI KOLOROWYMI */}
+          {selectedLesson && (
+            <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade">
+              <div className="bg-white rounded-[32px] max-w-md w-full p-6 sm:p-8 shadow-2xl space-y-5 relative">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                  <h3 className="text-xl font-black text-slate-900">Szczegóły lekcji</h3>
+                  <button onClick={()=>setSelectedLesson(null)} className="text-slate-400 bg-slate-50 p-2 rounded-full"><Icon name="x" size={16}/></button>
+                </div>
+                
+                <div className="bg-purple-50/70 p-5 rounded-2xl text-xs space-y-1.5 border border-purple-100">
+                  <span className="font-extrabold text-brand-primary uppercase text-[10px] block">Dane ucznia:</span>
+                  <span className="text-lg font-black text-slate-900 block">{selectedLesson.student_name}</span>
+                  <span className="text-slate-500 font-medium block">{selectedLesson.student_email || 'Brak e-maila'}</span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                    <span className="text-slate-400 font-bold block text-[10px] uppercase">Data:</span>
+                    <strong className="text-slate-800">{selectedLesson.lesson_date}</strong>
+                  </div>
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                    <span className="text-slate-400 font-bold block text-[10px] uppercase">Godzina:</span>
+                    <strong className="text-slate-800">{selectedLesson.time_start} - {selectedLesson.time_end}</strong>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="font-bold text-slate-400 block text-[10px] uppercase mb-1">Notatka od ucznia z rezerwacji:</span>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 text-slate-700 text-xs italic">
+                    "{selectedLesson.student_message || "Brak dodatkowej wiadomości."}"
+                  </div>
+                </div>
+
+                {selectedLesson.status === 'scheduled' && (
+                  <div className="pt-4 border-t border-purple-50">
+                    <span className="text-xs font-bold text-slate-700 block mb-3 text-center">Potwierdź obecność po zajęciach:</span>
+                    <div className="grid grid-cols-1 gap-2.5">
+                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'completed', 'held')} className="p-4 bg-emerald-500 hover:bg-emerald-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
+                        <Icon name="check-circle" size={20} /> ✓ Odbyła się na czas
+                      </button>
+                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'completed', 'late')} className="p-4 bg-amber-500 hover:bg-amber-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
+                        <Icon name="clock" size={20} /> ⏱ Uczeń spóźniony
+                      </button>
+                      <button onClick={() => handleUpdateLessonStatus(selectedLesson.id, 'cancelled', 'no_show')} className="p-4 bg-rose-500 hover:bg-rose-600 text-white rounded-2xl font-black shadow-md flex items-center justify-center gap-2 transition">
+                        <Icon name="x-circle" size={20} /> ✕ Uczeń nie przyszedł
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {selectedLesson.meet_url && (
+                  <a href={selectedLesson.meet_url} target="_blank" className="flex items-center justify-center gap-2 w-full py-4 mt-2 border-2 border-brand-primary text-brand-primary font-black rounded-xl hover:bg-purple-50 transition text-sm">
+                    <Icon name="video" size={18} /> Otwórz Google Meet
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(<TutorApp />);
+  </script>
+</body>
+</html>

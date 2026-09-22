@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EduSHOT — Centrala Administratora</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { sans: ['"Plus Jakarta Sans"', 'sans-serif'] }, colors: { brand: { primary: '#8B3DFF', magenta: '#D946EF' } } } } }
+  </script>
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #FAF8FE; color: #0F172A; min-height: 100vh; overflow-x: hidden; }
+    .sidebar-active { background: #8B3DFF; color: #FFFFFF !important; box-shadow: 0 8px 24px -4px rgba(139, 61, 255, 0.35); }
+    .sidebar-active svg { color: #FFFFFF !important; }
+    .gradient-cta { background: linear-gradient(135deg, #7C3AED 0%, #D946EF 100%); transition: transform 0.2s; }
+    .gradient-cta:hover:not(:disabled) { transform: translateY(-1.5px); box-shadow: 0 10px 30px -5px rgba(217, 70, 239, 0.38); }
+    .gradient-cta:disabled { opacity: 0.6; cursor: not-allowed; }
+  </style>
+</head>
+<body class="antialiased">
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // --- USTAWIENIA PRODUKCYJNE (PODMIEŃ) ---
+    const SUPABASE_URL = "https://twoj-projekt.supabase.co"; 
+    const SUPABASE_ANON_KEY = "twoj-klucz-anon"; 
+    const WORKER_URL = "https://twoj-worker.workers.dev"; 
+    
+    // Funkcja bezpiecznego czyszczenia adresu z podwójnych slashy
+    const getWorkerApi = (endpoint) => `${WORKER_URL.replace(/\/+$/, '')}${endpoint}`;
+    
+    const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
+
+    const Icon = ({ name, size = 18 }) => {
+      const spanRef = useRef(null);
+      useEffect(() => { if (spanRef.current && window.lucide) { spanRef.current.innerHTML = `<i data-lucide="${name}"></i>`; window.lucide.createIcons({ root: spanRef.current, attrs: { width: size, height: size } }); } }, [name, size]);
+      return <span ref={spanRef} className="inline-flex items-center justify-center shrink-0" />;
+    };
+
+    const Toast = ({ msg, type, onClose }) => {
+      useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
+      return (
+        <div className={`fixed bottom-6 right-6 z-[100] px-5 py-3.5 rounded-2xl shadow-2xl text-xs font-extrabold flex items-center gap-3 border ${type==='error'?'bg-rose-950 text-white border-rose-800':'bg-slate-900 text-white border-slate-700'}`}>
+          <span className={type==='error'?'text-rose-400':'text-emerald-400'}>{type==='error'?'✕':'✓'}</span><span>{msg}</span>
+        </div>
+      );
+    };
+
+    const formatMonthYear = (dateStr) => {
+      if(!dateStr) return "Nieznany miesiąc";
+      const m = new Date(dateStr).toLocaleDateString('pl-PL', { month: 'long', year: 'numeric' });
+      return m.charAt(0).toUpperCase() + m.slice(1);
+    };
+
+    function AdminApp() {
+      const [session, setSession] = useState(null);
+      const [adminEmail, setAdminEmail] = useState('');
+      const [loginEmail, setLoginEmail] = useState('');
+      const [loginPassword, setLoginPassword] = useState('');
+      const [loadingAuth, setLoadingAuth] = useState(true);
+      const [authError, setAuthError] = useState(null);
+
+      const [activeTab, setActiveTab] = useState('dashboard');
+      const [tutors, setTutors] = useState([]);
+      const [lessons, setLessons] = useState([]);
+      const [finances, setFinances] = useState([]);
+      
+      const [addTutorModal, setAddTutorModal] = useState(false);
+      const [editTutorData, setEditTutorData] = useState(null); // Stan trzymajacy dane edytowanego tutora
+      const [toast, setToast] = useState(null);
+      const [isActionLoading, setIsActionLoading] = useState(false);
+
+      const showToast = (msg, type='success') => setToast({msg, type});
+
+      useEffect(() => {
+        if(!supabase) return;
+        supabase.auth.getSession().then(({ data: { session } }) => {
+          if (session) verifyAdmin(session); else setLoadingAuth(false);
+        });
+        supabase.auth.onAuthStateChange((event, session) => {
+          if (!session) { setSession(null); setLoadingAuth(false); }
+        });
+      }, []);
+
+      const verifyAdmin = async (activeSession) => {
+        setLoadingAuth(true);
+        try {
+          const { data, error } = await supabase.from('user_roles').select('role').eq('user_id', activeSession.user.id).single();
+          if (error || data?.role !== 'admin') throw new Error('Brak uprawnień admina');
+          setSession(activeSession); setAdminEmail(activeSession.user.email);
+          loadData();
+        } catch(e) {
+          await supabase.auth.signOut();
+          setAuthError('Odmowa dostępu. Wymagane konto administratora.');
+        } finally { setLoadingAuth(false); }
+      };
+
+      const loadData = async () => {
+        const [tRes, lRes, fRes] = await Promise.all([
+          supabase.from('tutors').select('*').order('name'),
+          supabase.from('lessons').select('*').order('lesson_date', { ascending: false }),
+          supabase.from('lesson_finance').select('*')
+        ]);
+        if(tRes.data) setTutors(tRes.data);
+        if(lRes.data) setLessons(lRes.data);
+        if(fRes.data) setFinances(fRes.data);
+      };
+
+      const handleLogin = async (e) => {
+        e.preventDefault(); setAuthError(null); setLoadingAuth(true);
+        const { data, error } = await supabase.auth.signInWithPassword({ email: loginEmail, password: loginPassword });
+        if (error) { setAuthError('Błędne dane logowania'); setLoadingAuth(false); return; }
+        await verifyAdmin(data.session);
+      };
+
+      // TWORZENIE LUB EDYCJA TUTORA
+      const handleSaveTutor = async (e) => {
+        e.preventDefault();
+        setIsActionLoading(true);
+        
+        const payload = {
+          name: e.target.name.value.trim(),
+          email: e.target.email.value.trim().toLowerCase(),
+          iban: e.target.iban.value.trim(),
+          calSlug: e.target.slug.value.trim()
+        };
+
+        try {
+          if (editTutorData) {
+            // Update rekordu bezposrednio przez Supabase
+            const { error } = await supabase.from('tutors').update({
+              name: payload.name, email: payload.email, iban: payload.iban, cal_slug: payload.calSlug, cal_url: payload.calSlug ? `https://cal.com/${payload.calSlug}` : null
+            }).eq('id', editTutorData.id);
+            if (error) throw error;
+            showToast('Profil korepetytora zaktualizowany!');
+          } else {
+            // Nowe konto przez Worker (żeby Supabase Admin API stworzyło usera do logowania)
+            const res = await fetch(getWorkerApi('/api/admin/tutors'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
+              body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Błąd API podczas tworzenia');
+            showToast('Korepetytor dodany, wysłano mail z zaproszeniem!');
+          }
+          
+          setAddTutorModal(false);
+          setEditTutorData(null);
+          loadData();
+        } catch(err) {
+          showToast(err.message, 'error');
+        } finally {
+          setIsActionLoading(false);
+        }
+      };
+
+      // USUWANIE (ARCHIWIZACJA) TUTORA
+      const handleDeactivateTutor = async (tutorId, tutorName) => {
+        if (!confirm(`Czy na pewno chcesz usunąć/zdezaktywować nauczyciela ${tutorName}?\nLekcje i finanse zostaną w historii, ale zniknie on z aktywnej listy.`)) return;
+        
+        try {
+          const { error } = await supabase.from('tutors').update({ status: 'inactive' }).eq('id', tutorId);
+          if (error) throw error;
+          showToast(`Konto ${tutorName} zarchiwizowane.`);
+          loadData();
+        } catch (e) { showToast('Błąd usuwania.', 'error'); }
+      };
+
+      const handleMarkPaid = async (financeIds) => {
+        if(!confirm('Oznaczyć tę paczkę jako wypłaconą? (Zniknie z widoku)')) return;
+        try {
+          const { error } = await supabase.from('lesson_finance').update({ payout_paid: true }).in('lesson_id', financeIds);
+          if (error) throw error;
+          loadData();
+          showToast('Wypłata została odhaczona w bazie!');
+        } catch (e) { showToast('Błąd rozliczenia', 'error'); }
+      };
+
+      const metrics = useMemo(() => {
+        const activeTuts = tutors.filter(t => t.status === 'active').length;
+        let revenue = 0; let toPayout = 0;
+        finances.forEach(f => {
+          revenue += Number(f.student_price || 70); 
+          const l = lessons.find(lx => lx.id === f.lesson_id);
+          if (l && l.status === 'completed' && !f.payout_paid) {
+            toPayout += Number(f.tutor_rate || 35);
+          }
+        });
+        return { activeTuts, revenue, toPayout };
+      }, [lessons, tutors, finances]);
+
+      const payoutGroups = useMemo(() => {
+        const groups = {}; 
+        finances.forEach(f => {
+          const l = lessons.find(lx => lx.id === f.lesson_id);
+          if (l && l.status === 'completed' && !f.payout_paid) {
+            const tut = tutors.find(t => t.id === l.tutor_id);
+            if (!tut) return;
+
+            const monthKey = l.lesson_date ? l.lesson_date.substring(0, 7) : '0000-00'; 
+            const key = `${tut.id}_${monthKey}`;
+
+            if (!groups[key]) groups[key] = { tutor: tut, monthKey: monthKey, monthName: formatMonthYear(l.lesson_date), financeIds: [], totalSum: 0, lessonsCount: 0 };
+            
+            groups[key].financeIds.push(f.lesson_id);
+            groups[key].totalSum += Number(f.tutor_rate || 35);
+            groups[key].lessonsCount++;
+          }
+        });
+        return Object.values(groups).sort((a,b) => {
+          if(a.monthKey !== b.monthKey) return a.monthKey.localeCompare(b.monthKey);
+          return a.tutor.name.localeCompare(b.tutor.name);
+        });
+      }, [lessons, tutors, finances]);
+
+      if (loadingAuth) return <div className="min-h-screen flex items-center justify-center bg-[#FAF8FE]"><div className="w-10 h-10 border-4 border-brand-primary border-t-transparent rounded-full animate-spin"></div></div>;
+
+      if (!session) {
+        return (
+          <div className="min-h-screen bg-[#FAF8FE] flex items-center justify-center p-4">
+            <div className="w-full max-w-md bg-white rounded-[32px] p-10 shadow-card text-center">
+              <div className="w-12 h-12 rounded-2xl bg-brand-primary text-white flex items-center justify-center font-black text-xl mx-auto mb-4">⚡</div>
+              <h1 className="text-3xl font-black text-slate-900 tracking-tight mb-2">Centrala EduSHOT</h1>
+              <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-8">Logowanie Administratora</p>
+              {authError && <div className="p-3 bg-rose-50 text-rose-600 text-xs font-bold rounded-xl mb-4">{authError}</div>}
+              <form onSubmit={handleLogin} className="space-y-4">
+                <input type="email" required value={loginEmail} onChange={e=>setLoginEmail(e.target.value)} placeholder="E-mail admina" className="w-full p-4 rounded-2xl border border-slate-200 text-sm outline-none" />
+                <input type="password" required value={loginPassword} onChange={e=>setLoginPassword(e.target.value)} placeholder="Hasło" className="w-full p-4 rounded-2xl border border-slate-200 text-sm outline-none" />
+                <button type="submit" className="w-full py-4 rounded-2xl gradient-cta text-white font-black text-sm mt-2">Zaloguj się</button>
+              </form>
+            </div>
+          </div>
+        );
+      }
+
+      const NavItem = ({ id, label, icon }) => (
+        <button onClick={() => setActiveTab(id)} className={`w-full flex items-center gap-3.5 px-4 py-3.5 rounded-2xl font-bold text-sm transition-all ${activeTab === id ? 'sidebar-active' : 'text-slate-500 hover:bg-purple-50 hover:text-slate-800'}`}>
+          <Icon name={icon} size={18} /><span>{label}</span>
+        </button>
+      );
+
+      return (
+        <div className="min-h-screen bg-[#FAF8FE] flex flex-col lg:flex-row">
+          {toast && <Toast {...toast} onClose={() => setToast(null)} />}
+
+          <aside className="hidden lg:flex w-[280px] bg-white border-r border-purple-100 p-6 flex-col justify-between fixed inset-y-0 z-40">
+            <div>
+              <div className="flex items-center gap-2 mb-10 px-2 cursor-pointer" onClick={()=>setActiveTab('dashboard')}>
+                <div className="w-8 h-8 bg-brand-primary text-white rounded-xl flex items-center justify-center font-black">⚡</div>
+                <h1 className="text-xl font-black text-slate-900 tracking-tight">EduSHOT. <span className="text-[10px] bg-purple-100 text-brand-primary px-2 py-0.5 rounded-full relative -top-1">ADMIN</span></h1>
+              </div>
+              <nav className="space-y-1.5">
+                <NavItem id="dashboard" label="Dashboard" icon="layout-dashboard" />
+                <NavItem id="payouts" label="Rozliczenia co 10." icon="credit-card" />
+                <NavItem id="tutors" label="Korepetytorzy" icon="users" />
+              </nav>
+            </div>
+            <div className="pt-6 border-t border-slate-100 flex items-center justify-between px-2">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-slate-900 text-white font-black flex items-center justify-center text-lg">A</div>
+                <div className="overflow-hidden">
+                  <span className="block text-sm font-black text-slate-900 truncate">Administrator</span>
+                  <span className="block text-[10px] font-bold text-slate-400">{adminEmail}</span>
+                </div>
+              </div>
+              <button onClick={()=>supabase.auth.signOut()} className="p-2 text-slate-400 hover:text-rose-500 transition"><Icon name="log-out" size={18}/></button>
+            </div>
+          </aside>
+
+          <main className="flex-1 lg:pl-[280px] p-4 sm:p-8 w-full">
+            <header className="flex justify-between items-center mb-8 bg-white/50 backdrop-blur-sm p-4 rounded-3xl border border-purple-100 shadow-sm">
+              <h2 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight capitalize px-2">{activeTab}</h2>
+              <button onClick={loadData} className="p-2.5 rounded-xl bg-white border border-slate-200 text-slate-500 hover:text-brand-primary shadow-sm"><Icon name="refresh-cw" size={16}/></button>
+            </header>
+
+            {activeTab === 'dashboard' && (
+              <div className="space-y-8 animate-fade-in">
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                  <div className="bg-white p-6 rounded-3xl shadow-card border border-purple-50">
+                    <span className="block text-[10px] font-black text-slate-400 uppercase mb-1">Tutorzy (Aktywni)</span>
+                    <span className="block text-3xl font-black text-slate-900">{metrics.activeTuts}</span>
+                  </div>
+                  <div className="bg-white p-6 rounded-3xl shadow-card border border-purple-50">
+                    <span className="block text-[10px] font-black text-slate-400 uppercase mb-1">Przychód ogółem</span>
+                    <span className="block text-3xl font-black text-slate-900 font-mono">{metrics.revenue} zł</span>
+                  </div>
+                  <div className="bg-white p-6 rounded-3xl shadow-card border border-brand-primary/30 bg-brand-50">
+                    <span className="block text-[10px] font-black text-brand-primary uppercase mb-1">Do wypłaty tutorom</span>
+                    <span className="block text-3xl font-black text-brand-primary font-mono">{metrics.toPayout} zł</span>
+                  </div>
+                </div>
+                
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  <div className="lg:col-span-2 space-y-4">
+                    <h3 className="font-black text-lg text-slate-900 px-2">Zarejestrowane lekcje</h3>
+                    <div className="bg-white rounded-3xl p-6 shadow-card border border-purple-50 space-y-4">
+                      {lessons.slice(0,5).map(l => {
+                        const tut = tutors.find(t => t.id === l.tutor_id);
+                        const fin = finances.find(f => f.lesson_id === l.id);
+                        return (
+                          <div key={l.id} className="flex justify-between items-center p-4 bg-slate-50 rounded-2xl">
+                            <div className="flex items-center gap-4">
+                              <div className="w-12 h-12 bg-white rounded-xl shadow-sm flex flex-col items-center justify-center font-mono text-brand-primary text-xs font-black">
+                                {l.time_start}
+                              </div>
+                              <div>
+                                <span className="font-black text-sm text-slate-900 block">{l.student_name}</span>
+                                <span className="text-xs text-slate-500">{l.subject} • Tutor: {tut?.name}</span>
+                              </div>
+                            </div>
+                            <div className="text-right">
+                              <span className="block font-black text-xs text-slate-900 font-mono mb-1">Koszt: {fin?.tutor_rate || 35} zł</span>
+                              <span className={`px-2.5 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${l.status==='completed'?'bg-emerald-100 text-emerald-700':'bg-purple-100 text-brand-700'}`}>{l.status}</span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'payouts' && (
+              <div className="space-y-6 animate-fade-in">
+                {payoutGroups.length === 0 ? (
+                  <div className="bg-white rounded-3xl p-12 text-center shadow-sm">
+                    <h3 className="text-xl font-black text-slate-900">Wszystko rozliczone na czysto!</h3>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {payoutGroups.map(group => (
+                      <div key={`${group.tutor.id}_${group.monthKey}`} className="bg-white rounded-3xl p-6 shadow-card border border-purple-100 flex justify-between items-center">
+                        <div className="flex items-center gap-4">
+                          <div className="w-14 h-14 bg-gradient-to-tr from-brand-primary to-brand-magenta text-white rounded-2xl flex items-center justify-center font-black text-xl">{group.tutor.name[0]}</div>
+                          <div>
+                            <h3 className="font-black text-lg text-slate-900">{group.tutor.name} <span className="text-brand-primary text-xs bg-purple-50 px-2 py-0.5 rounded-full">{group.monthName}</span></h3>
+                            <p className="text-xs text-slate-500 mt-1">Należność: <strong className="font-mono text-slate-900">{group.totalSum} zł</strong> ({group.lessonsCount} lekcji)</p>
+                            <p className="text-xs text-slate-500">IBAN: <span className="font-mono">{group.tutor.iban || 'Brak'}</span></p>
+                          </div>
+                        </div>
+                        <button onClick={()=>handleMarkPaid(group.financeIds)} className="px-6 py-3 rounded-xl gradient-cta text-white font-black text-xs shadow-lg flex items-center gap-2">
+                          <Icon name="check" size={16}/> Oznacz wypłacone
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {activeTab === 'tutors' && (
+              <div className="space-y-6 animate-fade-in">
+                <div className="flex justify-between items-center bg-white p-4 rounded-3xl shadow-sm border border-purple-50">
+                  <h2 className="text-xl font-black text-slate-900 px-2">Aktywny Zespół ({tutors.filter(t=>t.status==='active').length})</h2>
+                  <button onClick={()=>{setEditTutorData(null); setAddTutorModal(true);}} className="px-6 py-3 rounded-full gradient-cta text-white font-black text-xs shadow-md">+ Dodaj Korepetytora</button>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  {tutors.filter(t=>t.status === 'active').map(t => (
+                    <div key={t.id} className="bg-white rounded-3xl p-6 shadow-card border border-purple-50 hover:border-purple-200 transition">
+                      <div className="flex items-center gap-4 mb-4">
+                        <div className="w-14 h-14 rounded-2xl bg-brand-primary text-white flex items-center justify-center text-xl font-black">{t.name[0]}</div>
+                        <div>
+                          <h3 className="font-black text-slate-900 text-lg">{t.name}</h3>
+                          <span className="text-xs font-bold text-slate-400">{t.email}</span>
+                        </div>
+                      </div>
+                      <div className="p-3 bg-slate-50 rounded-xl mb-4 border border-slate-100 text-xs space-y-1">
+                        <div className="flex justify-between"><span className="text-slate-400">Slug Cal.com:</span><span className="font-mono font-bold text-brand-primary">{t.cal_slug || 'Brak'}</span></div>
+                        <div className="flex justify-between"><span className="text-slate-400">IBAN:</span><span className="font-mono">{t.iban || 'Brak'}</span></div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={()=>{setEditTutorData(t); setAddTutorModal(true);}} className="flex-1 py-2.5 rounded-xl bg-purple-50 text-brand-primary font-black text-xs hover:bg-purple-100 transition">Edytuj profil</button>
+                        <button onClick={()=>handleDeactivateTutor(t.id, t.name)} className="py-2.5 px-4 rounded-xl bg-rose-50 text-rose-600 hover:bg-rose-100 font-bold text-xs transition">Zarchiwizuj (Usuń z listy)</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </main>
+
+          {/* DODAJ / EDYTUJ TUTORA MODAL */}
+          {addTutorModal && (
+            <div className="fixed inset-0 z-[60] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in" onClick={()=>setAddTutorModal(false)}>
+              <div className="bg-white rounded-[32px] max-w-lg w-full p-8 shadow-2xl relative" onClick={e=>e.stopPropagation()}>
+                <h3 className="text-2xl font-black text-slate-900 mb-6">{editTutorData ? 'Edytuj Profil Korepetytora' : 'Dodaj Nowego Korepetytora'}</h3>
+                <form onSubmit={handleSaveTutor} className="space-y-4 text-sm font-bold">
+                  <div>
+                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Imię i Nazwisko</label>
+                    <input type="text" name="name" required defaultValue={editTutorData?.name} placeholder="np. Jan Kowalski" className="w-full p-3 rounded-xl border outline-none focus:border-brand-primary"/>
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Adres e-mail (Login)</label>
+                    <input type="email" name="email" required defaultValue={editTutorData?.email} disabled={!!editTutorData} placeholder="jan@edushot.pl" className="w-full p-3 rounded-xl border outline-none disabled:bg-slate-50 disabled:text-slate-400"/>
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 text-[10px] uppercase mb-1">IBAN (Wypłaty 10-tego)</label>
+                    <input type="text" name="iban" defaultValue={editTutorData?.iban} placeholder="PL..." className="w-full p-3 rounded-xl border font-mono text-xs"/>
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 text-[10px] uppercase mb-1">Cal.com Slug</label>
+                    <input type="text" name="slug" required defaultValue={editTutorData?.cal_slug} placeholder="np. jan-kowalski" className="w-full p-3 rounded-xl border font-mono text-xs"/>
+                  </div>
+                  <div className="pt-4 flex gap-3">
+                    <button type="button" onClick={()=>setAddTutorModal(false)} className="flex-1 py-3.5 rounded-xl bg-slate-100 text-slate-700 hover:bg-slate-200 transition">Anuluj</button>
+                    <button type="submit" disabled={isActionLoading} className="flex-1 py-3.5 rounded-xl gradient-cta text-white shadow-glow">{isActionLoading ? 'Czekaj...' : (editTutorData ? 'Zapisz zmiany' : 'Utwórz konto')}</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+    ReactDOM.createRoot(document.getElementById('root')).render(<AdminApp />);
+  </script>
+</body>
+</html>
