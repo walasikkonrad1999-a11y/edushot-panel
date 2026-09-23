@@ -80,8 +80,89 @@ function AdminApp(){
   useEffect(()=>{ if(!supabase){setLoadingAuth(false);setAuthError('Nie udało się załadować Supabase.');return;} supabase.auth.getSession().then(({data:{session:s}})=>s?verifyAdmin(s):setLoadingAuth(false)); const {data:listener}=supabase.auth.onAuthStateChange((_e,s)=>{if(!s){setSession(null);setLoadingAuth(false)}}); return()=>listener?.subscription?.unsubscribe(); },[]);
   useEffect(()=>{ if(!session) return; const ch=supabase.channel('admin-core').on('postgres_changes',{event:'*',schema:'public',table:'lessons'},()=>loadData(false)).on('postgres_changes',{event:'*',schema:'public',table:'tutors'},()=>loadData(false)).subscribe(); return()=>supabase.removeChannel(ch); },[session]);
 
-  async function verifyAdmin(s){ setLoadingAuth(true); setAuthError(null); const {data,error}=await supabase.from('user_roles').select('role').eq('user_id',s.user.id).maybeSingle(); if(error||data?.role!=='admin'){ await supabase.auth.signOut(); setAuthError('Odmowa dostępu. Wymagane konto administratora.'); setLoadingAuth(false); return;} setSession(s); setAdminEmail(s.user.email||''); await loadData(true); setLoadingAuth(false); }
-  async function handleLogin(e){ e.preventDefault(); setLoadingAuth(true); const {data,error}=await supabase.auth.signInWithPassword({email:loginEmail,password:loginPassword}); if(error){setAuthError('Błędny e-mail lub hasło.');setLoadingAuth(false);return;} await verifyAdmin(data.session); }
+  async function verifyAdmin(s){
+    setLoadingAuth(true);
+    setAuthError(null);
+
+    try{
+      const {data,error}=await supabase
+        .from('user_roles')
+        .select('role')
+        .eq('user_id',s.user.id)
+        .maybeSingle();
+
+      if(error){
+        console.error('SUPABASE ADMIN ROLE ERROR:',error);
+        await supabase.auth.signOut();
+        setAuthError(
+          `Błąd weryfikacji uprawnień: ${error.message}` +
+          (error.code ? ` [${error.code}]` : '')
+        );
+        return;
+      }
+
+      if(data?.role!=='admin'){
+        await supabase.auth.signOut();
+        setAuthError(
+          `Logowanie poprawne, ale konto ${s.user.email||''} nie ma roli administratora.`
+        );
+        return;
+      }
+
+      setSession(s);
+      setAdminEmail(s.user.email||'');
+      await loadData(true);
+    }catch(error){
+      console.error('ADMIN VERIFY ERROR:',error);
+      await supabase.auth.signOut();
+      setAuthError(
+        `Błąd weryfikacji administratora: ${error?.message||'Nieznany błąd'}`
+      );
+    }finally{
+      setLoadingAuth(false);
+    }
+  }
+  async function handleLogin(e){
+    e.preventDefault();
+    setAuthError(null);
+    setLoadingAuth(true);
+
+    try{
+      const email=String(loginEmail||'').trim().toLowerCase();
+
+      const {data,error}=await supabase.auth.signInWithPassword({
+        email,
+        password:loginPassword
+      });
+
+      if(error){
+        console.error('SUPABASE LOGIN ERROR:',error);
+        setAuthError(
+          `Błąd logowania: ${error.message}` +
+          (error.code ? ` [${error.code}]` : '')
+        );
+        return;
+      }
+
+      if(!data?.session){
+        console.error('SUPABASE LOGIN ERROR: brak aktywnej sesji',data);
+        setAuthError(
+          'Błąd logowania: Supabase nie zwrócił aktywnej sesji.'
+        );
+        return;
+      }
+
+      await verifyAdmin(data.session);
+
+    }catch(error){
+      console.error('SUPABASE LOGIN EXCEPTION:',error);
+      setAuthError(
+        `Błąd logowania: ${error?.message||'Nieznany błąd'}`
+      );
+    }finally{
+      setLoadingAuth(false);
+    }
+  }
 
   async function safeSelect(table, queryFactory){ try{ const q=queryFactory?queryFactory(supabase.from(table)):supabase.from(table).select('*'); const {data,error}=await q; if(error){setTableHealth(h=>({...h,[table]:error.message})); return [];} setTableHealth(h=>({...h,[table]:'ok'})); return data||[]; }catch(e){setTableHealth(h=>({...h,[table]:e.message}));return [];} }
   async function loadData(spinner=true){ if(!supabase)return; if(spinner)setLoadingData(true); const [t,l,f,s,a,to,logs]=await Promise.all([
