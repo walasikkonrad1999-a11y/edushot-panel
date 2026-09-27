@@ -1137,7 +1137,7 @@ async function handleWebhook(request, env) {
   }
 
   if (save.lesson?.id) {
-    await saveFinance(env, save.lesson.id, level);
+    await saveFinance(env, save.lesson.id, level, policy);
 
     if (save.created) {
       await createTutorNotification(env, tutor, save.lesson, bookingPeople);
@@ -1400,6 +1400,7 @@ async function findTutorByField(env, field, value, caseInsensitive = false) {
   const c = config(env);
   const url = new URL(`${c.supabaseUrl}/rest/v1/tutors`);
   url.searchParams.set(field, `${caseInsensitive ? "ilike" : "eq"}.${value}`);
+  url.searchParams.set("status", "eq.active");
   url.searchParams.set(
     "select",
     "id,auth_user_id,name,email,status,timezone,cal_slug,cal_schedule_id"
@@ -1455,8 +1456,9 @@ async function saveLessonWithoutUpsertConstraint(env, lesson) {
   if (existing) {
     const patch = { ...lesson };
 
-    // Retry BOOKING_CREATED nie może cofnąć ręcznie oznaczonej obecności.
-    if (["completed", "no_show", "cancelled"].includes(existing.status)) {
+    // Retry BOOKING_CREATED nie może cofnąć żadnego stanu terminalnego,
+    // także cancelled_late, rescheduled ani stanów dodanych w przyszłości.
+    if (existing.status && existing.status !== "scheduled") {
       delete patch.status;
     }
 
@@ -1555,9 +1557,21 @@ async function patchLessonByProviderId(env, providerId, patch) {
 // FINANSE / POWIADOMIENIA
 // ============================================================
 
-async function saveFinance(env, lessonId, level) {
+async function saveFinance(env, lessonId, level, policy) {
   const c = config(env);
-  const tutorRate = level === "Rozszerzenie" ? 40 : 35;
+  const tutorRate = Number(
+    level === "Rozszerzenie"
+      ? policy?.extended_tutor_rate
+      : policy?.basic_tutor_rate
+  );
+
+  if (!Number.isFinite(tutorRate) || tutorRate < 0) {
+    throw new HttpError(
+      "Polityka rezerwacji zawiera nieprawidłową stawkę korepetytora.",
+      500,
+      "BOOKING_POLICY_ERROR"
+    );
+  }
 
   const url = new URL(`${c.supabaseUrl}/rest/v1/lesson_finance`);
   url.searchParams.set("lesson_id", `eq.${lessonId}`);
@@ -1571,30 +1585,7 @@ async function saveFinance(env, lessonId, level) {
   const rows = check.ok ? await check.json() : [];
 
   if (rows?.length) {
-    // Nie nadpisujemy historycznej stawki po rozliczeniu.
-    const updateUrl = new URL(`${c.supabaseUrl}/rest/v1/lesson_finance`);
-    updateUrl.searchParams.set("lesson_id", `eq.${lessonId}`);
-
-    const response = await fetch(updateUrl, {
-      method: "PATCH",
-      headers: serviceHeaders(env, {
-        "Content-Type": "application/json",
-        Prefer: "return=minimal"
-      }),
-      body: JSON.stringify({
-        tutor_rate: tutorRate,
-        updated_at: new Date().toISOString()
-      })
-    });
-
-    if (!response.ok) {
-      throw new HttpError(
-        `Błąd aktualizacji lesson_finance: ${await response.text()}`,
-        500,
-        "FINANCE_ERROR"
-      );
-    }
-
+    // Retry webhooka nie może zmienić historycznej stawki lekcji.
     return;
   }
 
@@ -1660,5 +1651,4 @@ function cleanNullable(value, max = 500) {
   const v = clean(value, max);
   return v || null;
 }
-
 
