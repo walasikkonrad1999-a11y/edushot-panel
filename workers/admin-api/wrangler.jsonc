@@ -1,0 +1,22 @@
+{
+  "name": "edushot-admin-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "secrets": {
+    "required": [
+      "SUPABASE_URL",
+      "SUPABASE_PUBLISHABLE_KEY",
+      "SUPABASE_SECRET_KEY"
+    ]
+  },
+  "vars": {
+    "TUTOR_INVITE_REDIRECT": "https://panel.edushot.workers.dev/tutor",
+    "ALLOWED_ORIGINS": "https://panel.edushot.workers.dev"
+  }
+}
+
