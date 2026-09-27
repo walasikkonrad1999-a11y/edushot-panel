@@ -635,7 +635,8 @@ async function handleCreateTimeOff(request, env) {
   );
 
   const schedule = current?.data || current;
-  let overrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  let overrides = [...originalOverrides];
 
   for (const date of dates) {
     overrides = overrides.filter(x => String(x?.date) !== date);
@@ -651,10 +652,37 @@ async function handleCreateTimeOff(request, env) {
     }
   );
 
+  let timeOff;
+  try {
+    timeOff = await insertTutorTimeOff(
+      env,
+      tutor.id,
+      startDate,
+      endDate,
+      cleanNullable(body.reason, 500)
+    );
+  } catch (error) {
+    try {
+      await calRequest(
+        env,
+        `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ overrides: originalOverrides })
+        }
+      );
+    } catch (rollbackError) {
+      console.error("Time-off rollback error:", rollbackError);
+    }
+    throw error;
+  }
+
   return json(request, env, {
     ok: true,
     data: {
+      id: timeOff?.id || null,
       providerId: `${startDate}__${endDate}`,
+      timeOff,
       dates
     }
   });
@@ -685,7 +713,8 @@ async function handleDeleteTimeOff(request, env, providerId) {
   );
 
   const schedule = current?.data || current;
-  const overrides = (Array.isArray(schedule?.overrides) ? schedule.overrides : [])
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  const overrides = originalOverrides
     .filter(x => !(
       blocked.has(String(x?.date)) &&
       String(x?.startTime) === "00:00" &&
@@ -701,10 +730,78 @@ async function handleDeleteTimeOff(request, env, providerId) {
     }
   );
 
+  try {
+    await deleteTutorTimeOff(env, tutor.id, startDate, endDate);
+  } catch (error) {
+    try {
+      await calRequest(
+        env,
+        `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ overrides: originalOverrides })
+        }
+      );
+    } catch (rollbackError) {
+      console.error("Time-off delete rollback error:", rollbackError);
+    }
+    throw error;
+  }
+
   return json(request, env, {
     ok: true,
     data: { deleted: true }
   });
+}
+
+async function insertTutorTimeOff(env, tutorId, dateFrom, dateTo, reason) {
+  const c = config(env);
+  const response = await fetch(`${c.supabaseUrl}/rest/v1/tutor_time_off`, {
+    method: "POST",
+    headers: serviceHeaders(env, {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Prefer: "return=representation"
+    }),
+    body: JSON.stringify([{
+      tutor_id: tutorId,
+      date_from: dateFrom,
+      date_to: dateTo,
+      reason
+    }])
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new HttpError(
+      `Błąd zapisu nieobecności: ${raw}`,
+      500,
+      "TIME_OFF_WRITE_ERROR"
+    );
+  }
+
+  return raw ? JSON.parse(raw)?.[0] || null : null;
+}
+
+async function deleteTutorTimeOff(env, tutorId, dateFrom, dateTo) {
+  const c = config(env);
+  const url = new URL(`${c.supabaseUrl}/rest/v1/tutor_time_off`);
+  url.searchParams.set("tutor_id", `eq.${tutorId}`);
+  url.searchParams.set("date_from", `eq.${dateFrom}`);
+  url.searchParams.set("date_to", `eq.${dateTo}`);
+
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: serviceHeaders(env, { Prefer: "return=minimal" })
+  });
+
+  if (!response.ok) {
+    throw new HttpError(
+      `Błąd usuwania nieobecności: ${await response.text()}`,
+      500,
+      "TIME_OFF_DELETE_ERROR"
+    );
+  }
 }
 
 // ============================================================
@@ -717,7 +814,7 @@ async function getBookingPolicy(env) {
   url.searchParams.set("id", "eq.1");
   url.searchParams.set(
     "select",
-    "cancellation_hours,reschedule_hours,basic_tutor_rate,extended_tutor_rate,currency"
+    "cancellation_hours,reschedule_hours,basic_tutor_rate,extended_tutor_rate,student_price,currency"
   );
   url.searchParams.set("limit", "1");
 
@@ -739,6 +836,7 @@ async function getBookingPolicy(env) {
     reschedule_hours: 6,
     basic_tutor_rate: 35,
     extended_tutor_rate: 40,
+    student_price: 70,
     currency: "PLN"
   };
 }
@@ -1598,7 +1696,7 @@ async function saveFinance(env, lessonId, level, policy) {
     body: JSON.stringify([{
       lesson_id: lessonId,
       tutor_rate: tutorRate,
-      student_price: 70,
+      student_price: Number(policy?.student_price ?? 70),
       payout_paid: false
     }])
   });
