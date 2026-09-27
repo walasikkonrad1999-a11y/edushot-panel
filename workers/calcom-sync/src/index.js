@@ -16,6 +16,7 @@
  * SUPABASE_ANON_KEY lub SUPABASE_PUBLISHABLE_KEY
  * SUPABASE_SERVICE_ROLE_KEY lub SUPABASE_SECRET_KEY
  * CAL_API_KEY
+ * CAL_WEBHOOK_SECRET
  * ALLOWED_ORIGINS=https://panel.edushot.workers.dev
  */
 
@@ -127,6 +128,7 @@ function config(env) {
     publishableKey: env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || "",
     secretKey: env.SUPABASE_SECRET_KEY || env.SUPABASE_SERVICE_ROLE_KEY || "",
     calApiKey: env.CAL_API_KEY || "",
+    calWebhookSecret: env.CAL_WEBHOOK_SECRET || "",
     allowedOrigins: String(env.ALLOWED_ORIGINS || DEFAULT_PANEL_ORIGIN)
       .split(",").map(x => x.trim()).filter(Boolean)
   };
@@ -139,6 +141,7 @@ function assertConfig(env) {
   if (!c.publishableKey) missing.push("SUPABASE_ANON_KEY lub SUPABASE_PUBLISHABLE_KEY");
   if (!c.secretKey) missing.push("SUPABASE_SERVICE_ROLE_KEY lub SUPABASE_SECRET_KEY");
   if (!c.calApiKey) missing.push("CAL_API_KEY");
+  if (!c.calWebhookSecret) missing.push("CAL_WEBHOOK_SECRET");
   if (missing.length) {
     throw new HttpError(`Brak zmiennych: ${missing.join(", ")}`, 500, "CONFIG_ERROR");
   }
@@ -177,6 +180,43 @@ async function readJson(request) {
   } catch {
     throw new HttpError("Nieprawidłowy JSON.", 400, "INVALID_JSON");
   }
+}
+
+function parseJson(rawBody) {
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    throw new HttpError("Nieprawidłowy JSON.", 400, "INVALID_JSON");
+  }
+}
+
+function hexToBytes(value) {
+  const normalized = String(value || "").replace(/^sha256=/i, "").trim();
+  if (!/^[a-f0-9]{64}$/i.test(normalized)) return null;
+
+  return Uint8Array.from(
+    normalized.match(/.{2}/g).map(byte => Number.parseInt(byte, 16))
+  );
+}
+
+async function verifyCalWebhook(request, env, rawBody) {
+  const signature = hexToBytes(request.headers.get("X-Cal-Signature-256"));
+  if (!signature) return false;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(config(env).calWebhookSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+
+  return crypto.subtle.verify(
+    "HMAC",
+    key,
+    signature,
+    new TextEncoder().encode(rawBody)
+  );
 }
 
 function serviceHeaders(env, extra = {}) {
@@ -771,7 +811,17 @@ function bookingUid(booking) {
 }
 
 async function handleWebhook(request, env) {
-  const envelope = await readJson(request);
+  const rawBody = await request.text();
+
+  if (!(await verifyCalWebhook(request, env, rawBody))) {
+    throw new HttpError(
+      "Nieprawidłowy podpis webhooka Cal.com.",
+      401,
+      "INVALID_WEBHOOK_SIGNATURE"
+    );
+  }
+
+  const envelope = parseJson(rawBody);
   const event = eventName(envelope);
   const booking = bookingPayload(envelope);
   const uid = bookingUid(booking);
@@ -1610,6 +1660,5 @@ function cleanNullable(value, max = 500) {
   const v = clean(value, max);
   return v || null;
 }
-
 
 
