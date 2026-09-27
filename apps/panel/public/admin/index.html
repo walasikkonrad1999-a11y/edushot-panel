@@ -195,7 +195,7 @@ function AdminApp(){
     safeSelect('payout_periods',q=>q.select('*').order('year',{ascending:false}).order('month',{ascending:false})),
     safeSelect('students',q=>q.select('*').order('created_at',{ascending:false})),
     safeSelect('tutor_availability',q=>q.select('*')),
-    safeSelect('tutor_time_off',q=>q.select('*').order('start_at',{ascending:false})),
+    safeSelect('tutor_time_off',q=>q.select('*').order('date_from',{ascending:false})),
     safeSelect('audit_logs',q=>q.select('*').order('created_at',{ascending:false}).limit(50))
   ]); setTutors(t);setLessons(l);setFinances(f);setPayoutPeriods(p);setStudents(s);setAvailability(a);setTimeOff(to);setAuditLogs(logs); setIntegrationHealth(h=>({...h,supabase:'ok'})); if(spinner)setLoadingData(false); }
 
@@ -381,5 +381,4 @@ ReactDOM.createRoot(document.getElementById('root')).render(<AdminApp/>);
 </script>
 </body>
 </html>
-
 
