@@ -20,7 +20,7 @@
  */
 
 const DEFAULT_ALLOWED_ORIGINS = [
-  "https://panel.edushot.workers.dev"
+  "https://panel.edushot.pl"
 ];
 
 function getAllowedOrigins(env) {
@@ -435,5 +435,3 @@ export default {
     }
   }
 };
-
-

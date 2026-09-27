@@ -19,6 +19,14 @@ Każdy element jest oddzielnym wdrożeniem Cloudflare Workers na jednym, główn
 | `workers/admin-api` | `edushot-admin-api` | operacje administratora wymagające klucza sekretnego |
 | `workers/calcom-sync` | `edushot-calcom-sync` | webhooki i synchronizacja Cal.com z Supabase |
 
+Docelowe adresy produkcyjne:
+
+- `https://panel.edushot.pl` — panel administratora i korepetytora,
+- `https://admin-api.edushot.pl` — operacje administracyjne,
+- `https://sync.edushot.pl` — Cal.com Sync i webhook.
+
+Główna strona `https://edushot.pl` oraz `https://www.edushot.pl` pozostaje osobnym Workerem i nie jest modyfikowana przez konfiguracje panelu.
+
 Kod Workerów nie może znajdować się w katalogu statycznych zasobów panelu. Dzięki temu źródła API ani pliki konfiguracyjne nie są publicznie serwowane.
 
 ## Sekrety i konfiguracja
@@ -44,4 +52,3 @@ Klucz `SUPABASE_SECRET_KEY` może występować wyłącznie po stronie Workerów.
 ## Stan fundamentów
 
 Ta gałąź porządkuje strukturę projektu i konfigurację wdrożeń. Nie wdraża jeszcze zmian do Cloudflare ani Supabase i nie zmienia istniejących adresów produkcyjnych.
-
