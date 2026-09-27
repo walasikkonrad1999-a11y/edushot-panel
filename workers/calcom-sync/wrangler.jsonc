@@ -1,0 +1,23 @@
+{
+  "name": "edushot-calcom-sync",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "secrets": {
+    "required": [
+      "SUPABASE_URL",
+      "SUPABASE_PUBLISHABLE_KEY",
+      "SUPABASE_SECRET_KEY",
+      "CAL_API_KEY",
+      "CAL_WEBHOOK_SECRET"
+    ]
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "https://panel.edushot.workers.dev"
+  }
+}
+
