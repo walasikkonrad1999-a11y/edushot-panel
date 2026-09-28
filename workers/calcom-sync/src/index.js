@@ -1009,6 +1009,22 @@ async function handleWebhook(request, env) {
 
     await patchLessonById(env, lesson.id, patch);
 
+    const tutor = lesson.tutor_id
+      ? await findTutorByField(env, "id", lesson.tutor_id, false, false)
+      : null;
+
+    await createTutorNotification(env, tutor, lesson, {
+      type: patch.status === "cancelled_late"
+        ? "lesson_cancelled_late"
+        : "lesson_cancelled",
+      title: patch.status === "cancelled_late"
+        ? "Lekcja anulowana po terminie"
+        : "Lekcja anulowana",
+      message:
+        `${lesson.student_name} • ${lesson.lesson_date} ${lesson.time_start}` +
+        (patch.status === "cancelled_late" ? " • pełna stawka dla korepetytora" : "")
+    });
+
     return json(request, env, {
       ok: true,
       data: {
@@ -1237,8 +1253,18 @@ async function handleWebhook(request, env) {
   if (save.lesson?.id) {
     await saveFinance(env, save.lesson.id, level, policy);
 
-    if (save.created) {
-      await createTutorNotification(env, tutor, save.lesson, bookingPeople);
+    if (isReschedule) {
+      await createTutorNotification(env, tutor, save.lesson, {
+        type: "lesson_rescheduled",
+        title: "Lekcja przełożona",
+        message: `${bookingPeople.studentName} • nowy termin ${save.lesson.lesson_date} ${save.lesson.time_start}`
+      });
+    } else if (save.created) {
+      await createTutorNotification(env, tutor, save.lesson, {
+        type: "lesson_created",
+        title: "Nowa lekcja",
+        message: `${bookingPeople.studentName} • ${save.lesson.lesson_date} ${save.lesson.time_start}`
+      });
     }
   }
 
@@ -1494,11 +1520,19 @@ async function findTutorFromBooking(booking, env) {
   return null;
 }
 
-async function findTutorByField(env, field, value, caseInsensitive = false) {
+async function findTutorByField(
+  env,
+  field,
+  value,
+  caseInsensitive = false,
+  activeOnly = true
+) {
   const c = config(env);
   const url = new URL(`${c.supabaseUrl}/rest/v1/tutors`);
   url.searchParams.set(field, `${caseInsensitive ? "ilike" : "eq"}.${value}`);
-  url.searchParams.set("status", "eq.active");
+  if (activeOnly) {
+    url.searchParams.set("status", "eq.active");
+  }
   url.searchParams.set(
     "select",
     "id,auth_user_id,name,email,status,timezone,cal_slug,cal_schedule_id"
@@ -1710,7 +1744,7 @@ async function saveFinance(env, lessonId, level, policy) {
   }
 }
 
-async function createTutorNotification(env, tutor, lesson, people) {
+async function createTutorNotification(env, tutor, lesson, notification) {
   if (!tutor?.auth_user_id || !lesson?.id) return;
 
   const c = config(env);
@@ -1719,13 +1753,13 @@ async function createTutorNotification(env, tutor, lesson, people) {
     method: "POST",
     headers: serviceHeaders(env, {
       "Content-Type": "application/json",
-      Prefer: "return=minimal"
+      Prefer: "resolution=ignore-duplicates,return=minimal"
     }),
     body: JSON.stringify([{
       user_id: tutor.auth_user_id,
-      type: "lesson_created",
-      title: "Nowa lekcja",
-      message: `${people.studentName} • ${lesson.lesson_date} ${lesson.time_start}`,
+      type: clean(notification?.type || "lesson_created", 80),
+      title: clean(notification?.title || "Aktualizacja lekcji", 160),
+      message: clean(notification?.message || "", 500) || null,
       lesson_id: lesson.id
     }])
   });
