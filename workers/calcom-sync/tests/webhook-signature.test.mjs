@@ -242,3 +242,66 @@ test("notifies the tutor about the new time after a reschedule", async () => {
   }
 });
 
+test("treats Cal.com placeholder notes as an empty tutor message", async () => {
+  const originalFetch = globalThis.fetch;
+  let savedLesson = null;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const method = init.method || "GET";
+
+    if (url.pathname.endsWith("/booking_policy")) return policyResponse();
+    if (url.pathname.endsWith("/tutors")) {
+      return Response.json([{
+        id: "00000000-0000-4000-8000-000000000210",
+        auth_user_id: null,
+        email: "tutor@example.com",
+        status: "active",
+        timezone: "Europe/Warsaw"
+      }]);
+    }
+    if (url.pathname.endsWith("/lessons") && method === "GET") {
+      return Response.json([]);
+    }
+    if (url.pathname.endsWith("/lessons") && method === "POST") {
+      savedLesson = JSON.parse(init.body)[0];
+      return Response.json([{
+        ...savedLesson,
+        id: "00000000-0000-4000-8000-000000000110"
+      }]);
+    }
+    if (url.pathname.endsWith("/lesson_finance") && method === "GET") {
+      return Response.json([]);
+    }
+    if (url.pathname.endsWith("/lesson_pricing")) {
+      return Response.json([{ student_price: 40, tutor_rate: 17.5, currency: "PLN" }]);
+    }
+    if (url.pathname.endsWith("/lesson_finance") && method === "POST") {
+      return new Response(null, { status: 201 });
+    }
+
+    throw new Error(`Unexpected request: ${method} ${url}`);
+  };
+
+  try {
+    const body = JSON.stringify({
+      triggerEvent: "BOOKING_CREATED",
+      payload: {
+        uid: "booking-placeholder-notes",
+        startTime: "2026-10-12T10:00:00.000Z",
+        endTime: "2026-10-12T10:30:00.000Z",
+        title: "Korepetycje Matematyka Szkoła Podstawowa 30 minut.",
+        organizer: { email: "tutor@example.com", timeZone: "Europe/Warsaw" },
+        attendees: [{ name: "Rezerwujący", email: "student@example.com" }],
+        additionalNotes: "additional_notes"
+      }
+    });
+
+    const response = await worker.fetch(signedRequest(body, signatureFor(body)), env);
+    assert.equal(response.status, 200);
+    assert.equal(savedLesson.student_message, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+

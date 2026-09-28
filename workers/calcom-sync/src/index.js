@@ -1366,6 +1366,22 @@ function firstField(entries, regex) {
   return entries.find(x => regex.test(x.normalized))?.value || null;
 }
 
+function isMessagePlaceholder(value) {
+  const normalized = normalizeText(value);
+  return !normalized || [
+    "additional note",
+    "additional notes",
+    "note",
+    "notes",
+    "message",
+    "optional message",
+    "wiadomosc",
+    "wiadomosc opcjonalnie",
+    "wiadomosc do korepetytora",
+    "wiadomosc do korepetytora opcjonalnie"
+  ].includes(normalized);
+}
+
 function extractBookingPeople(booking) {
   const entries = bookingFieldEntries(booking);
   const attendee = booking?.attendees?.[0] || {};
@@ -1417,15 +1433,19 @@ function extractMessage(booking) {
 
   for (const raw of direct) {
     const value = valueFromResponse(raw);
-    if (value && String(value).trim()) {
+    if (value && !isMessagePlaceholder(value)) {
       return clean(String(value), 5000);
     }
   }
 
-  return cleanNullable(
-    firstField(entries, /(wiadom|message|note|uwag|comment|komentarz)/i),
-    5000
+  const fieldValue = firstField(
+    entries,
+    /(wiadom|message|note|uwag|comment|komentarz)/i
   );
+
+  return isMessagePlaceholder(fieldValue)
+    ? null
+    : cleanNullable(fieldValue, 5000);
 }
 
 function extractLevel(booking, title) {
