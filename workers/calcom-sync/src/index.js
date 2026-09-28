@@ -814,7 +814,7 @@ async function getBookingPolicy(env) {
   url.searchParams.set("id", "eq.1");
   url.searchParams.set(
     "select",
-    "cancellation_hours,reschedule_hours,basic_tutor_rate,extended_tutor_rate,student_price,currency"
+    "cancellation_hours,reschedule_hours,currency"
   );
   url.searchParams.set("limit", "1");
 
@@ -834,9 +834,6 @@ async function getBookingPolicy(env) {
   return rows?.[0] || {
     cancellation_hours: 24,
     reschedule_hours: 6,
-    basic_tutor_rate: 35,
-    extended_tutor_rate: 40,
-    student_price: 70,
     currency: "PLN"
   };
 }
@@ -1177,6 +1174,7 @@ async function handleWebhook(request, env) {
 
   const bookingPeople = extractBookingPeople(booking);
   const level = extractLevel(booking, title);
+  const pricingTier = extractPricingTier(booking, title, level);
   const studentMessage = extractMessage(booking);
   const meetUrl = extractMeetUrl(booking);
   const bookingFields = sanitizeBookingFields(booking);
@@ -1192,6 +1190,7 @@ async function handleWebhook(request, env) {
 
     subject: title || "Matematyka",
     level,
+    pricing_tier: pricingTier,
 
     lesson_date: localStart.date,
     time_start: localStart.time,
@@ -1251,7 +1250,12 @@ async function handleWebhook(request, env) {
   }
 
   if (save.lesson?.id) {
-    await saveFinance(env, save.lesson.id, level, policy);
+    await saveFinance(
+      env,
+      save.lesson.id,
+      pricingTier,
+      lesson.duration_minutes
+    );
 
     if (isReschedule) {
       await createTutorNotification(env, tutor, save.lesson, {
@@ -1433,6 +1437,27 @@ function extractLevel(booking, title) {
 
   const searchable = `${title || ""} ${booking?.description || ""}`;
   return /rozszerz|extended/i.test(searchable) ? "Rozszerzenie" : "Podstawa";
+}
+
+function extractPricingTier(booking, title, level) {
+  const entries = bookingFieldEntries(booking);
+  const custom = firstField(entries, /(szkola|school|poziom|level|zakres|matura)/i);
+  const searchable = normalizeText(
+    `${custom || ""} ${title || ""} ${booking?.description || ""}`
+  );
+
+  if (/szkola podstawowa|primary school/.test(searchable)) {
+    return "primary_school";
+  }
+
+  if (
+    /rozszerz|extended/.test(searchable) ||
+    /rozszerz|extended/i.test(String(level || ""))
+  ) {
+    return "secondary_extended";
+  }
+
+  return "secondary_basic";
 }
 
 function sanitizeBookingFields(booking) {
@@ -1689,22 +1714,43 @@ async function patchLessonByProviderId(env, providerId, patch) {
 // FINANSE / POWIADOMIENIA
 // ============================================================
 
-async function saveFinance(env, lessonId, level, policy) {
+async function getLessonPricing(env, pricingTier, durationMinutes) {
   const c = config(env);
-  const tutorRate = Number(
-    level === "Rozszerzenie"
-      ? policy?.extended_tutor_rate
-      : policy?.basic_tutor_rate
-  );
+  const url = new URL(`${c.supabaseUrl}/rest/v1/lesson_pricing`);
+  url.searchParams.set("pricing_tier", `eq.${pricingTier}`);
+  url.searchParams.set("duration_minutes", `eq.${durationMinutes}`);
+  url.searchParams.set("active", "eq.true");
+  url.searchParams.set("select", "student_price,tutor_rate,currency");
+  url.searchParams.set("limit", "1");
 
-  if (!Number.isFinite(tutorRate) || tutorRate < 0) {
+  const response = await fetch(url, {
+    headers: serviceHeaders(env, { Accept: "application/json" })
+  });
+
+  if (!response.ok) {
     throw new HttpError(
-      "Polityka rezerwacji zawiera nieprawidłową stawkę korepetytora.",
+      `Błąd odczytu cennika: ${await response.text()}`,
       500,
-      "BOOKING_POLICY_ERROR"
+      "PRICING_READ_ERROR"
     );
   }
 
+  const rows = await response.json();
+  const pricing = rows?.[0] || null;
+
+  if (!pricing) {
+    throw new HttpError(
+      `Brak aktywnej ceny dla poziomu ${pricingTier} i czasu ${durationMinutes} min.`,
+      422,
+      "PRICING_NOT_FOUND"
+    );
+  }
+
+  return pricing;
+}
+
+async function saveFinance(env, lessonId, pricingTier, durationMinutes) {
+  const c = config(env);
   const url = new URL(`${c.supabaseUrl}/rest/v1/lesson_finance`);
   url.searchParams.set("lesson_id", `eq.${lessonId}`);
   url.searchParams.set("select", "lesson_id");
@@ -1721,6 +1767,23 @@ async function saveFinance(env, lessonId, level, policy) {
     return;
   }
 
+  const pricing = await getLessonPricing(env, pricingTier, durationMinutes);
+  const tutorRate = Number(pricing.tutor_rate);
+  const studentPrice = Number(pricing.student_price);
+
+  if (
+    !Number.isFinite(tutorRate) ||
+    !Number.isFinite(studentPrice) ||
+    tutorRate < 0 ||
+    studentPrice < tutorRate
+  ) {
+    throw new HttpError(
+      "Cennik zawiera nieprawidłowe kwoty.",
+      500,
+      "PRICING_ERROR"
+    );
+  }
+
   const response = await fetch(`${c.supabaseUrl}/rest/v1/lesson_finance`, {
     method: "POST",
     headers: serviceHeaders(env, {
@@ -1730,7 +1793,7 @@ async function saveFinance(env, lessonId, level, policy) {
     body: JSON.stringify([{
       lesson_id: lessonId,
       tutor_rate: tutorRate,
-      student_price: Number(policy?.student_price ?? 70),
+      student_price: studentPrice,
       payout_paid: false
     }])
   });

@@ -34,9 +34,6 @@ function policyResponse() {
   return Response.json([{
     cancellation_hours: 24,
     reschedule_hours: 6,
-    basic_tutor_rate: 35,
-    extended_tutor_rate: 40,
-    student_price: 70,
     currency: "PLN"
   }]);
 }
@@ -59,8 +56,6 @@ test("accepts the raw-body HMAC signature produced by Cal.com", async () => {
   globalThis.fetch = async () => Response.json([{
     cancellation_hours: 24,
     reschedule_hours: 6,
-    basic_tutor_rate: 35,
-    extended_tutor_rate: 40,
     currency: "PLN"
   }]);
 
@@ -145,6 +140,8 @@ test("creates an idempotent tutor notification when a lesson is cancelled", asyn
 test("notifies the tutor about the new time after a reschedule", async () => {
   const originalFetch = globalThis.fetch;
   const notificationBodies = [];
+  const lessonBodies = [];
+  const financeBodies = [];
   const tutor = {
     id: "00000000-0000-4000-8000-000000000202",
     auth_user_id: "00000000-0000-4000-8000-000000000302",
@@ -186,12 +183,19 @@ test("notifies the tutor about the new time after a reschedule", async () => {
       return Response.json([{ ...oldLesson, status: "rescheduled" }]);
     }
     if (url.pathname.endsWith("/lessons") && method === "POST") {
+      lessonBodies.push(JSON.parse(init.body));
       return Response.json([newLesson]);
+    }
+    if (url.pathname.endsWith("/lesson_pricing") && method === "GET") {
+      assert.equal(url.searchParams.get("pricing_tier"), "eq.secondary_basic");
+      assert.equal(url.searchParams.get("duration_minutes"), "eq.60");
+      return Response.json([{ student_price: 70, tutor_rate: 40, currency: "PLN" }]);
     }
     if (url.pathname.endsWith("/lesson_finance") && method === "GET") {
       return Response.json([]);
     }
     if (url.pathname.endsWith("/lesson_finance") && method === "POST") {
+      financeBodies.push(JSON.parse(init.body));
       return new Response(null, { status: 201 });
     }
     if (url.pathname.endsWith("/notifications") && method === "POST") {
@@ -227,6 +231,9 @@ test("notifies the tutor about the new time after a reschedule", async () => {
 
     assert.equal(response.status, 200);
     assert.equal(result.data.created, true);
+    assert.equal(lessonBodies[0][0].pricing_tier, "secondary_basic");
+    assert.equal(financeBodies[0][0].student_price, 70);
+    assert.equal(financeBodies[0][0].tutor_rate, 40);
     assert.equal(notificationBodies.length, 1);
     assert.equal(notificationBodies[0][0].type, "lesson_rescheduled");
     assert.match(notificationBodies[0][0].message, /nowy termin/);
