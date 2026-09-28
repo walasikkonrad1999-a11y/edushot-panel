@@ -457,7 +457,9 @@ async function removeTutor(request, env, tutorId) {
     auth_user_id: null,
     email: `removed+${tutor.id}@archive.edushot.local`,
     cal_slug: null,
-    cal_url: null,
+    // cal_url is NOT NULL in the existing production schema. A unique,
+    // non-routable tombstone frees the real Cal.com URL without losing history.
+    cal_url: `https://archive.edushot.local/tutors/${tutor.id}`,
     cal_schedule_id: null,
     status: "removed",
     onboarding_completed: false,
