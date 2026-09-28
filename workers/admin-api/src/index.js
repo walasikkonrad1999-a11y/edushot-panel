@@ -4,6 +4,7 @@
  * Endpointy:
  * GET  /api/health
  * POST /api/admin/tutors
+ * DELETE /api/admin/tutors/:id
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -37,7 +38,7 @@ function corsHeaders(request, env) {
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -205,6 +206,28 @@ async function insertOne(env, table, row) {
   return raw ? JSON.parse(raw) : null;
 }
 
+async function updateOne(env, table, id, row) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("id", `eq.${id}`);
+
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: adminHeaders(env, {
+      "Content-Type": "application/json",
+      "Accept": "application/vnd.pgrst.object+json",
+      "Prefer": "return=representation"
+    }),
+    body: JSON.stringify(row)
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Błąd aktualizacji tabeli ${table}: ${raw}`);
+  }
+
+  return raw ? JSON.parse(raw) : null;
+}
+
 async function deleteRows(env, table, filters) {
   const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
 
@@ -286,6 +309,23 @@ async function deleteAuthUser(env, userId) {
     );
   } catch (error) {
     console.error("Rollback auth user:", error);
+  }
+}
+
+async function deleteAuthUserStrict(env, userId) {
+  if (!userId) return;
+
+  const response = await fetch(
+    `${env.SUPABASE_URL}/auth/v1/admin/users/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: adminHeaders(env) }
+  );
+
+  if (!response.ok && response.status !== 404) {
+    const details = await response.text();
+    throw Object.assign(
+      new Error(`Nie udało się usunąć konta logowania: ${details}`),
+      { status: 502, code: "AUTH_DELETE_ERROR" }
+    );
   }
 }
 
@@ -385,6 +425,73 @@ async function createTutor(request, env) {
   }
 }
 
+async function removeTutor(request, env, tutorId) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(tutorId)) {
+    throw Object.assign(new Error("Nieprawidłowe ID korepetytora."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status === "removed") {
+    throw Object.assign(new Error("Korepetytor nie istnieje lub został już usunięty."), {
+      status: 404,
+      code: "TUTOR_NOT_FOUND"
+    });
+  }
+
+  if (tutor.auth_user_id === admin.id) {
+    throw Object.assign(new Error("Nie można usunąć własnego konta administratora."), {
+      status: 409,
+      code: "SELF_DELETE_BLOCKED"
+    });
+  }
+
+  await deleteAuthUserStrict(env, tutor.auth_user_id);
+
+  const removedTutor = await updateOne(env, "tutors", tutor.id, {
+    auth_user_id: null,
+    email: `removed+${tutor.id}@archive.edushot.local`,
+    cal_slug: null,
+    cal_url: null,
+    cal_schedule_id: null,
+    status: "removed",
+    onboarding_completed: false,
+    updated_at: new Date().toISOString()
+  });
+
+  if (tutor.auth_user_id) {
+    await deleteRows(env, "user_roles", { user_id: tutor.auth_user_id });
+  }
+
+  try {
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_removed",
+      entity_type: "tutor",
+      entity_id: tutor.id,
+      details: {
+        tutor_name: tutor.name,
+        previous_email: tutor.email,
+        history_preserved: true
+      }
+    });
+  } catch (error) {
+    console.error("Tutor removal audit log:", error);
+  }
+
+  return {
+    tutor: removedTutor,
+    email_released: true,
+    history_preserved: true
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -415,6 +522,16 @@ export default {
         return json(request, env, { ok: true, data }, 201);
       }
 
+      const tutorDeleteMatch = url.pathname.match(/^\/api\/admin\/tutors\/([^/]+)$/);
+      if (request.method === "DELETE" && tutorDeleteMatch) {
+        const data = await removeTutor(
+          request,
+          env,
+          decodeURIComponent(tutorDeleteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
       return json(request, env, {
         ok: false,
         error: {
@@ -435,3 +552,4 @@ export default {
     }
   }
 };
+
