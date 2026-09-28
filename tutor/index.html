@@ -22,7 +22,7 @@
 const {useState,useEffect,useMemo,useRef}=React;
 const SUPABASE_URL="https://lmcebpymlekptqowofyg.supabase.co";
 const SUPABASE_ANON_KEY="sb_publishable_i5T1e4AbawLisqsgDEbxdw_vsb5CaRH";
-const SCHEDULER_API_URL=window.EDUSHOT_SCHEDULER_API_URL||"https://sync.edushot.pl";
+const SCHEDULER_API_URL=window.EDUSHOT_SCHEDULER_API_URL||"https://edushot-calcom-sync.edushot.workers.dev";
 const supabase=window.supabase?.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);
 const DAYS=['poniedziałek','wtorek','środa','czwartek','piątek','sobota','niedziela'];
 const defaultAvailability=()=>DAYS.map(day=>({day,active:false,intervals:[{start:'16:00',end:'20:00'}]}));

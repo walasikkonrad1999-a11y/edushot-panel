@@ -9,17 +9,17 @@
 Worker `edushot`, który obsługuje `edushot.pl` i `www.edushot.pl`, jest poza zakresem
 wdrożenia paneli i nie może być modyfikowany podczas migracji.
 
-## Środowisko testowe
+## Darmowe adresy produkcyjne
 
-| Element | Worker | Adres testowy |
+| Element | Worker | Adres |
 | --- | --- | --- |
-| Panel | `panel` | `https://panel.walasikkonrad1999.workers.dev` |
-| Admin API | `edushot-admin-api` | `https://edushot-admin-api.walasikkonrad1999.workers.dev` |
-| Cal.com Sync | `edushot-calcom-sync` | `https://edushot-calcom-sync.walasikkonrad1999.workers.dev` |
+| Panel | `panel` | `https://panel.edushot.workers.dev` |
+| Admin API | `edushot-admin-api` | `https://edushot-admin-api.edushot.workers.dev` |
+| Cal.com Sync | `edushot-calcom-sync` | `https://edushot-calcom-sync.edushot.workers.dev` |
 
-Adresy `workers.dev` są włączone wyłącznie do testów. Preview URLs są wyłączone.
-Panel testowy ustawia adresy API przez `window.EDUSHOT_ADMIN_API_URL` i
-`window.EDUSHOT_SCHEDULER_API_URL`, bez zmiany kodu produkcyjnego.
+Adresy `workers.dev` są docelowym, bezpłatnym środowiskiem paneli. Preview URLs
+są wyłączone. Panel może nadpisać adresy API przez
+`window.EDUSHOT_ADMIN_API_URL` i `window.EDUSHOT_SCHEDULER_API_URL`.
 
 ## Sekrety wymagane przed testami end-to-end
 
@@ -29,21 +29,12 @@ Panel testowy ustawia adresy API przez `window.EDUSHOT_ADMIN_API_URL` i
 
 Wartości nie mogą trafić do GitHuba ani do plików HTML.
 
-## Docelowe domeny
-
-- `panel.edushot.pl` → `panel`,
-- `admin-api.edushot.pl` → `edushot-admin-api`,
-- `sync.edushot.pl` → `edushot-calcom-sync`.
-
-Domeny należy przypiąć dopiero po poprawnym teście logowania, tworzenia i
-dezaktywowania korepetytora, dostępności, nieobecności, webhooków oraz wypłat.
-
 ## Kolejność przełączenia
 
 1. Ustawić sekrety na nowych Workerach.
 2. Zastosować wersjonowane migracje Supabase.
 3. Wykonać testy end-to-end na `workers.dev`.
-4. Przypiąć trzy docelowe subdomeny.
-5. Zmienić URL webhooka w Cal.com na `https://sync.edushot.pl/api/webhook/calcom`.
-6. Powtórzyć test rezerwacji, anulowania, przełożenia i wypłaty.
-7. Dopiero wtedy wyłączyć zasoby na starym koncie Cloudflare.
+4. Ustawić URL webhooka w Cal.com na
+   `https://edushot-calcom-sync.edushot.workers.dev/api/webhook/calcom`.
+5. Powtórzyć test rezerwacji, anulowania, przełożenia i wypłaty.
+6. Dopiero wtedy wyłączyć zasoby na starym koncie Cloudflare.
