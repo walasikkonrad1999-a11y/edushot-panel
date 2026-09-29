@@ -5,6 +5,10 @@
  * GET  /api/health
  * POST /api/admin/tutors
  * DELETE /api/admin/tutors/:id
+ * POST /api/admin/regular-students
+ * PATCH /api/admin/regular-students/:id
+ * DELETE /api/admin/regular-students/:id
+ * POST /api/admin/regular-students/:id/reactivate
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -38,7 +42,7 @@ function corsHeaders(request, env) {
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -226,6 +230,38 @@ async function updateOne(env, table, id, row) {
   }
 
   return raw ? JSON.parse(raw) : null;
+}
+
+async function callRpc(env, functionName, payload) {
+  const response = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/rpc/${functionName}`,
+    {
+      method: "POST",
+      headers: adminHeaders(env, {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      }),
+      body: JSON.stringify(payload)
+    }
+  );
+
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {}
+
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(data?.message || raw || "Nie udało się zapisać danych."),
+      {
+        status: response.status >= 500 ? 500 : 400,
+        code: data?.code || "DATABASE_ERROR"
+      }
+    );
+  }
+
+  return data;
 }
 
 async function deleteRows(env, table, filters) {
@@ -494,6 +530,148 @@ async function removeTutor(request, env, tutorId) {
   };
 }
 
+function assertUuid(value, label = "ID") {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw Object.assign(new Error(`Nieprawidłowe ${label}.`), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw Object.assign(new Error("Nieprawidłowe dane formularza."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+}
+
+function regularStudentPayload(body) {
+  const studentName = clean(body.studentName, 160);
+  const guardianName = clean(body.guardianName, 160);
+  const guardianEmail = clean(body.guardianEmail, 254).toLowerCase();
+  const guardianPhone = clean(body.guardianPhone, 40);
+  const startedOn = clean(body.startedOn, 10);
+
+  if (studentName.length < 2) {
+    throw Object.assign(new Error("Podaj imię i nazwisko ucznia."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (guardianName.length < 2) {
+    throw Object.assign(new Error("Podaj imię i nazwisko rodzica lub opiekuna."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (!guardianEmail && !guardianPhone) {
+    throw Object.assign(new Error("Podaj e-mail lub telefon rodzica."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (guardianEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guardianEmail)) {
+    throw Object.assign(new Error("Podaj prawidłowy e-mail rodzica."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (startedOn && !/^\d{4}-\d{2}-\d{2}$/.test(startedOn)) {
+    throw Object.assign(new Error("Podaj prawidłową datę rozpoczęcia."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  return {
+    p_student_name: studentName,
+    p_guardian_name: guardianName,
+    p_guardian_email: guardianEmail || null,
+    p_guardian_phone: guardianPhone || null,
+    p_started_on: startedOn || null
+  };
+}
+
+async function createRegularStudent(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularStudentPayload(await readJson(request));
+
+  const studentId = await callRpc(
+    env,
+    "edushot_admin_create_regular_student",
+    {
+      ...payload,
+      p_actor_user_id: admin.id,
+      p_actor_email: admin.email || null
+    }
+  );
+
+  return { student_id: studentId };
+}
+
+async function updateRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularStudentPayload(await readJson(request));
+
+  await callRpc(env, "edushot_admin_update_regular_student", {
+    p_student_id: studentId,
+    ...payload,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId };
+}
+
+async function endRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zakończenia współpracy."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  await callRpc(env, "edushot_admin_set_regular_student_status", {
+    p_student_id: studentId,
+    p_status: "ended",
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId, status: "ended" };
+}
+
+async function reactivateRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+
+  await callRpc(env, "edushot_admin_set_regular_student_status", {
+    p_student_id: studentId,
+    p_status: "active",
+    p_reason: null,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId, status: "active" };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -522,6 +700,43 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/admin/tutors") {
         const data = await createTutor(request, env);
         return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/regular-students") {
+        const data = await createRegularStudent(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const regularStudentReactivateMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)\/reactivate$/
+      );
+      if (request.method === "POST" && regularStudentReactivateMatch) {
+        const data = await reactivateRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentReactivateMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularStudentMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)$/
+      );
+      if (request.method === "PATCH" && regularStudentMatch) {
+        const data = await updateRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+      if (request.method === "DELETE" && regularStudentMatch) {
+        const data = await endRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentMatch[1])
+        );
+        return json(request, env, { ok: true, data });
       }
 
       const tutorDeleteMatch = url.pathname.match(/^\/api\/admin\/tutors\/([^/]+)$/);

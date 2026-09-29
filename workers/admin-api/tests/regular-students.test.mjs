@@ -1,0 +1,111 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import worker from "../src/index.js";
+
+const env = {
+  SUPABASE_URL: "https://example.supabase.co",
+  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
+  SUPABASE_SECRET_KEY: "sb_secret_test",
+  ALLOWED_ORIGINS: "https://panel.edushot.workers.dev"
+};
+
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+test("creates a regular student only after verifying the administrator", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, init });
+
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    if (url.endsWith("/rest/v1/rpc/edushot_admin_create_regular_student")) {
+      return jsonResponse("22222222-2222-4222-8222-222222222222");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://api.example/api/admin/regular-students", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          Origin: "https://panel.edushot.workers.dev",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          studentName: "Jan Kowalski",
+          guardianName: "Anna Kowalska",
+          guardianEmail: "ANNA@EXAMPLE.COM",
+          guardianPhone: "+48 500 000 000",
+          startedOn: "2026-10-01"
+        })
+      }),
+      env
+    );
+
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.data.student_id, "22222222-2222-4222-8222-222222222222");
+
+    const rpcCall = calls.find(call =>
+      call.url.endsWith("/rest/v1/rpc/edushot_admin_create_regular_student")
+    );
+    assert.ok(rpcCall);
+    const payload = JSON.parse(rpcCall.init.body);
+    assert.equal(payload.p_guardian_email, "anna@example.com");
+    assert.equal(payload.p_actor_email, "admin@edushot.pl");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("requires a reason before ending a regular cooperation", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request(
+        "https://api.example/api/admin/regular-students/22222222-2222-4222-8222-222222222222",
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: "Bearer test-token",
+            Origin: "https://panel.edushot.workers.dev",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ reason: "  " })
+        }
+      ),
+      env
+    );
+
+    assert.equal(response.status, 400);
+    const body = await response.json();
+    assert.equal(body.error.code, "VALIDATION_ERROR");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
