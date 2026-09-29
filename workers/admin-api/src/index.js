@@ -9,6 +9,8 @@
  * PATCH /api/admin/regular-students/:id
  * DELETE /api/admin/regular-students/:id
  * POST /api/admin/regular-students/:id/reactivate
+ * PUT  /api/admin/regular-students/:id/plan
+ * DELETE /api/admin/regular-students/:id/plan
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -42,7 +44,7 @@ function corsHeaders(request, env) {
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
@@ -672,6 +674,110 @@ async function reactivateRegularStudent(request, env, studentId) {
   return { student_id: studentId, status: "active" };
 }
 
+function regularLessonPlanPayload(body) {
+  const tutorId = clean(body.tutorId, 36);
+  const subject = clean(body.subject, 120);
+  const level = clean(body.level, 120);
+  const pricingTier = clean(body.pricingTier, 40);
+  const durationMinutes = Number(body.durationMinutes);
+  const weekday = Number(body.weekday);
+  const startTime = clean(body.startTime, 5);
+  const frequency = clean(body.frequency, 20);
+  const timezone = clean(body.timezone, 80) || "Europe/Warsaw";
+  const meetUrl = clean(body.meetUrl, 500).toLowerCase();
+  const startsOn = clean(body.startsOn, 10);
+
+  assertUuid(tutorId, "ID korepetytora");
+  if (!subject || !level) {
+    throw Object.assign(new Error("Uzupełnij przedmiot i poziom."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!["primary_school", "secondary_basic", "secondary_extended"].includes(pricingTier)) {
+    throw Object.assign(new Error("Wybierz prawidłowy poziom rozliczeniowy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (![30, 60, 90].includes(durationMinutes)) {
+    throw Object.assign(new Error("Długość zajęć musi wynosić 30, 60 albo 90 minut."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!Number.isInteger(weekday) || weekday < 1 || weekday > 7) {
+    throw Object.assign(new Error("Wybierz prawidłowy dzień tygodnia."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+    throw Object.assign(new Error("Podaj prawidłową godzinę rozpoczęcia."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!["weekly", "biweekly"].includes(frequency)) {
+    throw Object.assign(new Error("Wybierz prawidłową częstotliwość."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^https:\/\/meet\.google\.com\/[a-z0-9-]+(?:[/?#].*)?$/i.test(meetUrl)) {
+    throw Object.assign(new Error("Podaj prawidłowy stały link Google Meet."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startsOn)) {
+    throw Object.assign(new Error("Podaj prawidłową datę rozpoczęcia planu."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+
+  return {
+    p_tutor_id: tutorId,
+    p_subject: subject,
+    p_level: level,
+    p_pricing_tier: pricingTier,
+    p_duration_minutes: durationMinutes,
+    p_weekday: weekday,
+    p_start_time: startTime,
+    p_frequency: frequency,
+    p_timezone: timezone,
+    p_meet_url: meetUrl,
+    p_starts_on: startsOn
+  };
+}
+
+async function replaceRegularLessonPlan(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularLessonPlanPayload(await readJson(request));
+  const planId = await callRpc(env, "edushot_admin_replace_regular_lesson_plan", {
+    p_student_id: studentId,
+    ...payload,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { student_id: studentId, plan_id: planId };
+}
+
+async function endRegularLessonPlan(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zakończenia planu."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  await callRpc(env, "edushot_admin_end_regular_lesson_plan", {
+    p_student_id: studentId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { student_id: studentId, status: "ended" };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -715,6 +821,22 @@ export default {
           request,
           env,
           decodeURIComponent(regularStudentReactivateMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularStudentPlanMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)\/plan$/
+      );
+      if (request.method === "PUT" && regularStudentPlanMatch) {
+        const data = await replaceRegularLessonPlan(
+          request, env, decodeURIComponent(regularStudentPlanMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+      if (request.method === "DELETE" && regularStudentPlanMatch) {
+        const data = await endRegularLessonPlan(
+          request, env, decodeURIComponent(regularStudentPlanMatch[1])
         );
         return json(request, env, { ok: true, data });
       }

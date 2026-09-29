@@ -109,3 +109,95 @@ test("requires a reason before ending a regular cooperation", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("replaces a regular lesson plan with validated scheduling data", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    if (url.endsWith("/rest/v1/rpc/edushot_admin_replace_regular_lesson_plan")) {
+      return jsonResponse("33333333-3333-4333-8333-333333333333");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://api.example/api/admin/regular-students/22222222-2222-4222-8222-222222222222/plan", {
+        method: "PUT",
+        headers: {
+          Authorization: "Bearer test-token",
+          Origin: "https://panel.edushot.workers.dev",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          tutorId: "44444444-4444-4444-8444-444444444444",
+          subject: "Matematyka",
+          level: "Szkoła średnia — rozszerzenie",
+          pricingTier: "secondary_extended",
+          durationMinutes: 60,
+          weekday: 3,
+          startTime: "17:30",
+          frequency: "weekly",
+          timezone: "Europe/Warsaw",
+          meetUrl: "HTTPS://MEET.GOOGLE.COM/ABC-DEFG-HIJ",
+          startsOn: "2026-10-05"
+        })
+      }),
+      env
+    );
+
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.data.plan_id, "33333333-3333-4333-8333-333333333333");
+    const rpcCall = calls.find(call =>
+      call.url.endsWith("/rest/v1/rpc/edushot_admin_replace_regular_lesson_plan")
+    );
+    const payload = JSON.parse(rpcCall.init.body);
+    assert.equal(payload.p_meet_url, "https://meet.google.com/abc-defg-hij");
+    assert.equal(payload.p_weekday, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects a non-Google Meet link before calling the database", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://api.example/api/admin/regular-students/22222222-2222-4222-8222-222222222222/plan", {
+        method: "PUT",
+        headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tutorId: "44444444-4444-4444-8444-444444444444",
+          subject: "Matematyka", level: "Podstawa", pricingTier: "primary_school",
+          durationMinutes: 60, weekday: 1, startTime: "16:00", frequency: "weekly",
+          meetUrl: "https://example.com/room", startsOn: "2026-10-05"
+        })
+      }),
+      env
+    );
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, "VALIDATION_ERROR");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
