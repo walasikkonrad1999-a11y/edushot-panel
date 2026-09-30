@@ -17,10 +17,10 @@
  * SUPABASE_SERVICE_ROLE_KEY lub SUPABASE_SECRET_KEY
  * CAL_API_KEY
  * CAL_WEBHOOK_SECRET
- * ALLOWED_ORIGINS=https://panel.edushot.pl
+ * ALLOWED_ORIGINS=https://panel.edushot.workers.dev
  */
 
-const DEFAULT_PANEL_ORIGIN = "https://panel.edushot.pl";
+const DEFAULT_PANEL_ORIGIN = "https://panel.edushot.workers.dev";
 const CAL_API_VERSION = "2024-06-11";
 
 const DAY_TO_CAL = {

@@ -33,7 +33,7 @@
  */
 
 const DEFAULT_ALLOWED_ORIGINS = [
-  "https://panel.edushot.pl"
+  "https://panel.edushot.workers.dev"
 ];
 const CAL_API_VERSION = "2024-06-11";
 

@@ -1,15 +1,9 @@
 {
   "name": "edushot-calcom-sync",
   "main": "src/index.js",
-  "compatibility_date": "2026-09-27",
+  "compatibility_date": "2026-09-30",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "routes": [
-    {
-      "pattern": "sync.edushot.pl",
-      "custom_domain": true
-    }
-  ],
   "observability": {
     "enabled": true
   },
@@ -23,6 +17,6 @@
     ]
   },
   "vars": {
-    "ALLOWED_ORIGINS": "https://panel.edushot.pl"
+    "ALLOWED_ORIGINS": "https://panel.edushot.workers.dev"
   }
 }
