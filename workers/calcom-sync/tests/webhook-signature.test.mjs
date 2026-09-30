@@ -38,6 +38,20 @@ function policyResponse() {
   }]);
 }
 
+test("keeps tutor time off read-only because administration manages absences", async () => {
+  const response = await worker.fetch(
+    new Request("https://sync.example.com/api/tutor/time-off", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ startAt: "2026-10-10", endAt: "2026-10-12" })
+    }),
+    env
+  );
+  const result = await response.json();
+  assert.equal(response.status, 403);
+  assert.equal(result.error.code, "ADMIN_MANAGED_TIME_OFF");
+});
+
 test("rejects a webhook with an invalid Cal.com signature", async () => {
   const response = await worker.fetch(
     signedRequest("{}", "0".repeat(64)),

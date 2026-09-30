@@ -6,6 +6,7 @@ const env = {
   SUPABASE_URL: "https://example.supabase.co",
   SUPABASE_PUBLISHABLE_KEY: "sb_publishable_test",
   SUPABASE_SECRET_KEY: "sb_secret_test",
+  CAL_API_KEY: "cal_test_key",
   ALLOWED_ORIGINS: "https://panel.edushot.workers.dev"
 };
 
@@ -267,4 +268,93 @@ test("assigns a substitute only through the secured RPC", async () => {
     const rpcCall = calls.find(call => call.url.endsWith("/rest/v1/rpc/edushot_admin_substitute_regular_lesson"));
     assert.equal(JSON.parse(rpcCall.init.body).p_substitute_tutor_id, "44444444-4444-4444-8444-444444444444");
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("validates an administrator-managed tutor absence before Cal.com changes", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    calls.push(url);
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://api.example/api/admin/tutors/22222222-2222-4222-8222-222222222222/time-off", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ dateFrom: "2026-10-12", dateTo: "2026-10-10", reason: "Urlop" })
+      }),
+      env
+    );
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, "VALIDATION_ERROR");
+    assert.equal(calls.some(url => url.startsWith("https://api.cal.com")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("adds tutor time off in Cal.com and Supabase through the admin API", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    calls.push({ url, init });
+    if (url.endsWith("/auth/v1/user")) {
+      return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    }
+    if (url.includes("/rest/v1/user_roles")) {
+      return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
+    }
+    if (url.includes("/rest/v1/tutors?")) {
+      return jsonResponse([{ id: "22222222-2222-4222-8222-222222222222", name: "Tutor", status: "active", cal_schedule_id: "12345" }]);
+    }
+    if (url === "https://api.cal.com/v2/schedules/12345" && (!init.method || init.method === "GET")) {
+      return jsonResponse({ data: { overrides: [] } });
+    }
+    if (url === "https://api.cal.com/v2/schedules/12345" && init.method === "PATCH") {
+      return jsonResponse({ data: { updated: true } });
+    }
+    if (url.endsWith("/rest/v1/tutor_time_off")) {
+      return jsonResponse({ id: "33333333-3333-4333-8333-333333333333", tutor_id: "22222222-2222-4222-8222-222222222222" });
+    }
+    if (url.endsWith("/rest/v1/audit_logs")) {
+      return jsonResponse({ id: "44444444-4444-4444-8444-444444444444" });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://api.example/api/admin/tutors/22222222-2222-4222-8222-222222222222/time-off", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer test-token",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ dateFrom: "2026-10-10", dateTo: "2026-10-11", reason: "Urlop" })
+      }),
+      env
+    );
+    assert.equal(response.status, 201);
+    const patchCall = calls.find(call => call.url.startsWith("https://api.cal.com") && call.init.method === "PATCH");
+    assert.ok(patchCall);
+    assert.deepEqual(JSON.parse(patchCall.init.body).overrides, [
+      { date: "2026-10-10", startTime: "00:00", endTime: "00:00" },
+      { date: "2026-10-11", startTime: "00:00", endTime: "00:00" }
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

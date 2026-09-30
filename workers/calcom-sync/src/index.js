@@ -86,16 +86,24 @@ export default {
       }
 
       if (request.method === "POST" && path === "/api/tutor/time-off") {
-        return await handleCreateTimeOff(request, env);
+        return json(request, env, {
+          ok: false,
+          error: {
+            code: "ADMIN_MANAGED_TIME_OFF",
+            message: "Nieobecności zapisuje administracja EduSHOT po zgłoszeniu korepetytora."
+          }
+        }, 403);
       }
 
       const timeOff = path.match(/^\/api\/tutor\/time-off\/(.+)$/);
       if (request.method === "DELETE" && timeOff) {
-        return await handleDeleteTimeOff(
-          request,
-          env,
-          decodeURIComponent(timeOff[1])
-        );
+        return json(request, env, {
+          ok: false,
+          error: {
+            code: "ADMIN_MANAGED_TIME_OFF",
+            message: "Nieobecności usuwa administracja EduSHOT."
+          }
+        }, 403);
       }
 
       return json(request, env, {

@@ -14,6 +14,8 @@
  * POST /api/admin/regular-plans/generate
  * POST /api/admin/regular-plans/:id/breaks
  * POST /api/admin/regular-lessons/:id/substitute
+ * POST /api/admin/tutors/:id/time-off
+ * DELETE /api/admin/tutor-time-off/:id
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -32,6 +34,7 @@
 const DEFAULT_ALLOWED_ORIGINS = [
   "https://panel.edushot.pl"
 ];
+const CAL_API_VERSION = "2024-06-11";
 
 function getAllowedOrigins(env) {
   return (env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
@@ -276,10 +279,61 @@ async function deleteRows(env, table, filters) {
     url.searchParams.set(key, `eq.${value}`);
   }
 
-  await fetch(url.toString(), {
+  const response = await fetch(url.toString(), {
     method: "DELETE",
     headers: adminHeaders(env)
   });
+
+  if (!response.ok) {
+    throw new Error(`Błąd usuwania z tabeli ${table}: ${await response.text()}`);
+  }
+}
+
+async function calRequest(env, endpoint, options = {}) {
+  if (!env.CAL_API_KEY) {
+    throw Object.assign(new Error("Brak konfiguracji Cal.com w API administratora."), {
+      status: 500,
+      code: "CAL_CONFIG_ERROR"
+    });
+  }
+
+  const response = await fetch(`https://api.cal.com${endpoint}`, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${env.CAL_API_KEY}`,
+      "cal-api-version": CAL_API_VERSION,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const raw = await response.text();
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+  if (!response.ok) {
+    throw Object.assign(new Error(`Cal.com: ${data?.error?.message || data?.message || raw || `HTTP ${response.status}`}`), {
+      status: 502,
+      code: "CAL_API_ERROR"
+    });
+  }
+  return data;
+}
+
+function datesBetween(start, end) {
+  const current = new Date(`${start}T12:00:00Z`);
+  const last = new Date(`${end}T12:00:00Z`);
+  const dates = [];
+  if (Number.isNaN(current.getTime()) || Number.isNaN(last.getTime()) || current > last) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  while (current <= last) {
+    dates.push(current.toISOString().slice(0, 10));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  return dates;
 }
 
 async function inviteTutor(env, email, name) {
@@ -842,6 +896,139 @@ async function substituteRegularLesson(request, env, lessonId) {
   return { lesson_id: lessonId, tutor_id: tutorId };
 }
 
+async function addTutorTimeOff(request, env, tutorId) {
+  assertUuid(tutorId, "ID korepetytora");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const dateFrom = clean(body.dateFrom, 10);
+  const dateTo = clean(body.dateTo, 10);
+  const reason = clean(body.reason, 500);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(dateTo) || dateTo < dateFrom) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status !== "active") {
+    throw Object.assign(new Error("Nie znaleziono aktywnego korepetytora."), {
+      status: 404,
+      code: "TUTOR_NOT_FOUND"
+    });
+  }
+  if (!tutor.cal_schedule_id) {
+    throw Object.assign(new Error("Korepetytor nie ma ustawionego Cal.com Schedule ID."), {
+      status: 409,
+      code: "MISSING_SCHEDULE_ID"
+    });
+  }
+
+  const blockedDates = datesBetween(dateFrom, dateTo);
+  const current = await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" });
+  const schedule = current?.data || current;
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  let overrides = [...originalOverrides];
+  for (const date of blockedDates) {
+    overrides = overrides.filter(item => String(item?.date) !== date);
+    overrides.push({ date, startTime: "00:00", endTime: "00:00" });
+  }
+  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+    method: "PATCH",
+    body: JSON.stringify({ overrides })
+  });
+
+  try {
+    const row = await insertOne(env, "tutor_time_off", {
+      tutor_id: tutorId,
+      date_from: dateFrom,
+      date_to: dateTo,
+      reason
+    });
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_time_off_added",
+      entity_type: "tutor_time_off",
+      entity_id: row.id,
+      details: { tutor_id: tutorId, date_from: dateFrom, date_to: dateTo, reason }
+    });
+    return row;
+  } catch (error) {
+    try {
+      await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ overrides: originalOverrides })
+      });
+    } catch (rollbackError) {
+      console.error("Tutor time-off rollback error:", rollbackError);
+    }
+    throw error;
+  }
+}
+
+async function removeTutorTimeOff(request, env, timeOffId) {
+  assertUuid(timeOffId, "ID nieobecności");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const timeOff = await selectOne(env, "tutor_time_off", { id: timeOffId });
+  if (!timeOff) {
+    throw Object.assign(new Error("Nie znaleziono nieobecności."), {
+      status: 404,
+      code: "TIME_OFF_NOT_FOUND"
+    });
+  }
+  const tutor = await selectOne(env, "tutors", { id: timeOff.tutor_id });
+  if (!tutor?.cal_schedule_id) {
+    throw Object.assign(new Error("Korepetytor nie ma ustawionego Cal.com Schedule ID."), {
+      status: 409,
+      code: "MISSING_SCHEDULE_ID"
+    });
+  }
+
+  const blocked = new Set(datesBetween(timeOff.date_from, timeOff.date_to));
+  const current = await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" });
+  const schedule = current?.data || current;
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  const overrides = originalOverrides.filter(item => !(
+    blocked.has(String(item?.date)) && String(item?.startTime) === "00:00" && String(item?.endTime) === "00:00"
+  ));
+  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+    method: "PATCH",
+    body: JSON.stringify({ overrides })
+  });
+
+  try {
+    await deleteRows(env, "tutor_time_off", { id: timeOffId });
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_time_off_removed",
+      entity_type: "tutor_time_off",
+      entity_id: timeOffId,
+      details: { tutor_id: timeOff.tutor_id, date_from: timeOff.date_from, date_to: timeOff.date_to }
+    });
+    return { id: timeOffId, deleted: true };
+  } catch (error) {
+    try {
+      await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ overrides: originalOverrides })
+      });
+    } catch (rollbackError) {
+      console.error("Tutor time-off delete rollback error:", rollbackError);
+    }
+    throw error;
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -898,6 +1085,26 @@ export default {
       if (request.method === "POST" && regularLessonSubstituteMatch) {
         const data = await substituteRegularLesson(
           request, env, decodeURIComponent(regularLessonSubstituteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const tutorTimeOffMatch = url.pathname.match(
+        /^\/api\/admin\/tutors\/([^/]+)\/time-off$/
+      );
+      if (request.method === "POST" && tutorTimeOffMatch) {
+        const data = await addTutorTimeOff(
+          request, env, decodeURIComponent(tutorTimeOffMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const timeOffDeleteMatch = url.pathname.match(
+        /^\/api\/admin\/tutor-time-off\/([^/]+)$/
+      );
+      if (request.method === "DELETE" && timeOffDeleteMatch) {
+        const data = await removeTutorTimeOff(
+          request, env, decodeURIComponent(timeOffDeleteMatch[1])
         );
         return json(request, env, { ok: true, data });
       }
