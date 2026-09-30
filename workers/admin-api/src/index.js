@@ -11,6 +11,9 @@
  * POST /api/admin/regular-students/:id/reactivate
  * PUT  /api/admin/regular-students/:id/plan
  * DELETE /api/admin/regular-students/:id/plan
+ * POST /api/admin/regular-plans/generate
+ * POST /api/admin/regular-plans/:id/breaks
+ * POST /api/admin/regular-lessons/:id/substitute
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -778,6 +781,67 @@ async function endRegularLessonPlan(request, env, studentId) {
   return { student_id: studentId, status: "ended" };
 }
 
+async function generateRegularLessons(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const horizonDays = Number(body.horizonDays ?? 90);
+  if (!Number.isInteger(horizonDays) || horizonDays < 7 || horizonDays > 366) {
+    throw Object.assign(new Error("Horyzont musi obejmować od 7 do 366 dni."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const result = await callRpc(env, "edushot_generate_all_regular_lessons", {
+    p_horizon_days: horizonDays
+  });
+  return result;
+}
+
+async function addRegularPlanBreak(request, env, planId) {
+  assertUuid(planId, "ID planu");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const dateFrom = clean(body.dateFrom, 10);
+  const dateTo = clean(body.dateTo, 10);
+  const reason = clean(body.reason, 500);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(dateTo) || dateTo < dateFrom) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres przerwy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód przerwy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const breakId = await callRpc(env, "edushot_admin_add_regular_break", {
+    p_plan_id: planId, p_date_from: dateFrom, p_date_to: dateTo, p_reason: reason,
+    p_actor_user_id: admin.id, p_actor_email: admin.email || null
+  });
+  return { break_id: breakId, plan_id: planId };
+}
+
+async function substituteRegularLesson(request, env, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const reason = clean(body.reason, 500);
+  assertUuid(tutorId, "ID korepetytora zastępującego");
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zastępstwa."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  await callRpc(env, "edushot_admin_substitute_regular_lesson", {
+    p_lesson_id: lessonId, p_substitute_tutor_id: tutorId, p_reason: reason,
+    p_actor_user_id: admin.id, p_actor_email: admin.email || null
+  });
+  return { lesson_id: lessonId, tutor_id: tutorId };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -811,6 +875,31 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/admin/regular-students") {
         const data = await createRegularStudent(request, env);
         return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/regular-plans/generate") {
+        const data = await generateRegularLessons(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularPlanBreakMatch = url.pathname.match(
+        /^\/api\/admin\/regular-plans\/([^/]+)\/breaks$/
+      );
+      if (request.method === "POST" && regularPlanBreakMatch) {
+        const data = await addRegularPlanBreak(
+          request, env, decodeURIComponent(regularPlanBreakMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const regularLessonSubstituteMatch = url.pathname.match(
+        /^\/api\/admin\/regular-lessons\/([^/]+)\/substitute$/
+      );
+      if (request.method === "POST" && regularLessonSubstituteMatch) {
+        const data = await substituteRegularLesson(
+          request, env, decodeURIComponent(regularLessonSubstituteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
       }
 
       const regularStudentReactivateMatch = url.pathname.match(
