@@ -17,6 +17,35 @@ function jsonResponse(body, status = 200) {
   });
 }
 
+test("cancels a Cal.com lesson before the transactional database update", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input); calls.push({ url, init });
+    if (url.endsWith("/auth/v1/user")) return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    if (url.includes("/rest/v1/user_roles")) return jsonResponse([{ role: "admin" }]);
+    if (url.includes("/rest/v1/lessons?")) return jsonResponse([{
+      id: "22222222-2222-4222-8222-222222222222", tutor_id: "33333333-3333-4333-8333-333333333333",
+      status: "scheduled", provider: "cal.com", provider_booking_id: "booking-uid", regular_plan_id: null
+    }]);
+    if (url === "https://api.cal.com/v2/bookings/booking-uid") return jsonResponse({ status: "cancelled" });
+    if (url.endsWith("/rest/v1/rpc/edushot_admin_cancel_lesson")) return jsonResponse({ lesson_id: "22222222-2222-4222-8222-222222222222", status: "cancelled" });
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://api.example/api/admin/lessons/22222222-2222-4222-8222-222222222222/cancel", {
+      method: "POST", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "Odwołane organizacyjnie" })
+    }), env);
+    assert.equal(response.status, 200);
+    const calIndex = calls.findIndex(call => call.url.includes("api.cal.com/v2/bookings"));
+    const rpcIndex = calls.findIndex(call => call.url.endsWith("/rest/v1/rpc/edushot_admin_cancel_lesson"));
+    assert.ok(calIndex >= 0 && rpcIndex > calIndex);
+    assert.equal(calls[calIndex].init.method, "DELETE");
+    assert.equal(JSON.parse(calls[calIndex].init.body).cancellationReason, "Odwołane organizacyjnie");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("creates a regular student only after verifying the administrator", async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;

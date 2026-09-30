@@ -17,6 +17,8 @@
  * POST /api/admin/regular-occurrences/:id/substitute
  * POST /api/admin/tutors/:id/time-off
  * DELETE /api/admin/tutor-time-off/:id
+ * POST /api/admin/lessons/:id/cancel
+ * POST /api/admin/cal-availability/sync
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -199,6 +201,20 @@ async function selectOne(env, table, filters) {
   return rows?.[0] || null;
 }
 
+async function selectRows(env, table, configure, select = "*") {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("select", select);
+  if (typeof configure === "function") configure(url.searchParams);
+  const response = await fetch(url.toString(), {
+    headers: adminHeaders(env, { "Accept": "application/json" })
+  });
+  if (!response.ok) {
+    throw new Error(`Błąd odczytu tabeli ${table}: ${await response.text()}`);
+  }
+  const rows = await response.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
 async function insertOne(env, table, row) {
   const response = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
     method: "POST",
@@ -335,6 +351,152 @@ function datesBetween(start, end) {
     current.setUTCDate(current.getUTCDate() + 1);
   }
   return dates;
+}
+
+function warsawDateKey(date = new Date()) {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Warsaw", year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(date);
+}
+
+function addDateDays(dateKey, days) {
+  const date = new Date(`${dateKey}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function timeToMinutes(value) {
+  const match = String(value || "").match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function minutesToTime(value) {
+  const minutes = Math.max(0, Math.min(1440, Number(value)));
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+function subtractBusyWindows(windows, busyWindows) {
+  const busy = busyWindows
+    .map(item => [timeToMinutes(item.start), timeToMinutes(item.end)])
+    .filter(([start, end]) => start !== null && end !== null && end > start)
+    .sort((a, b) => a[0] - b[0]);
+  return windows.flatMap(window => {
+    const start = timeToMinutes(window.start);
+    const end = timeToMinutes(window.end);
+    if (start === null || end === null || end <= start) return [];
+    let parts = [[start, end]];
+    for (const [busyStart, busyEnd] of busy) {
+      parts = parts.flatMap(([partStart, partEnd]) => {
+        if (busyEnd <= partStart || busyStart >= partEnd) return [[partStart, partEnd]];
+        const result = [];
+        if (busyStart > partStart) result.push([partStart, Math.min(busyStart, partEnd)]);
+        if (busyEnd < partEnd) result.push([Math.max(busyEnd, partStart), partEnd]);
+        return result;
+      });
+    }
+    return parts.filter(([partStart, partEnd]) => partEnd > partStart)
+      .map(([partStart, partEnd]) => ({ start: minutesToTime(partStart), end: minutesToTime(partEnd) }));
+  });
+}
+
+const CAL_WEEKDAY = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function weeklyWindowsForDate(availability, dateKey) {
+  const weekday = CAL_WEEKDAY[new Date(`${dateKey}T12:00:00Z`).getUTCDay()];
+  return (Array.isArray(availability) ? availability : [])
+    .filter(item => Array.isArray(item?.days) && item.days.includes(weekday))
+    .map(item => ({ start: String(item.startTime || "").slice(0, 5), end: String(item.endTime || "").slice(0, 5) }))
+    .filter(item => timeToMinutes(item.start) !== null && timeToMinutes(item.end) > timeToMinutes(item.start));
+}
+
+async function syncTutorCalSchedule(env, tutorId, horizonDays = 120) {
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status !== "active") return { tutor_id: tutorId, skipped: "inactive" };
+  if (!tutor.cal_schedule_id) return { tutor_id: tutorId, skipped: "missing_schedule_id" };
+
+  const today = warsawDateKey();
+  const horizon = addDateDays(today, horizonDays);
+  const [lessons, timeOff, current] = await Promise.all([
+    selectRows(env, "lessons", params => {
+      params.set("tutor_id", `eq.${tutorId}`);
+      params.set("regular_plan_id", "not.is.null");
+      params.set("status", "in.(scheduled,confirmed)");
+      params.set("lesson_date", `gte.${today}`);
+      params.append("lesson_date", `lte.${horizon}`);
+    }, "id,lesson_date,time_start,time_end"),
+    selectRows(env, "tutor_time_off", params => {
+      params.set("tutor_id", `eq.${tutorId}`);
+      params.set("date_to", `gte.${today}`);
+      params.set("date_from", `lte.${horizon}`);
+    }, "date_from,date_to"),
+    calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" })
+  ]);
+
+  const schedule = current?.data || current || {};
+  const availability = Array.isArray(schedule.availability) ? schedule.availability : [];
+  const existingOverrides = Array.isArray(schedule.overrides) ? schedule.overrides : [];
+  const generated = new Map();
+
+  for (const absence of timeOff) {
+    const from = absence.date_from < today ? today : absence.date_from;
+    const to = absence.date_to > horizon ? horizon : absence.date_to;
+    for (const date of datesBetween(from, to)) generated.set(date, [{ date, startTime: "00:00", endTime: "00:00" }]);
+  }
+
+  const lessonsByDate = new Map();
+  for (const lesson of lessons) {
+    if (!lessonsByDate.has(lesson.lesson_date)) lessonsByDate.set(lesson.lesson_date, []);
+    lessonsByDate.get(lesson.lesson_date).push({ start: lesson.time_start, end: lesson.time_end });
+  }
+  for (const [date, busy] of lessonsByDate) {
+    if (generated.has(date)) continue;
+    const openWindows = subtractBusyWindows(weeklyWindowsForDate(availability, date), busy);
+    generated.set(date, openWindows.length
+      ? openWindows.map(window => ({ date, startTime: window.start, endTime: window.end }))
+      : [{ date, startTime: "00:00", endTime: "00:00" }]);
+  }
+
+  const preserved = existingOverrides.filter(item => {
+    const date = String(item?.date || "");
+    return !/^\d{4}-\d{2}-\d{2}$/.test(date) || date < today || date > horizon;
+  });
+  const overrides = [...preserved, ...[...generated.values()].flat()]
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.startTime).localeCompare(String(b.startTime)));
+  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+    method: "PATCH", body: JSON.stringify({ overrides })
+  });
+  return { tutor_id: tutorId, blocked_dates: generated.size, lessons: lessons.length, time_off: timeOff.length };
+}
+
+async function syncTutorSchedules(env, tutorIds, horizonDays = 120) {
+  const results = [];
+  for (const tutorId of [...new Set(tutorIds.filter(Boolean))]) {
+    try {
+      results.push(await syncTutorCalSchedule(env, tutorId, horizonDays));
+    } catch (error) {
+      console.error("Cal availability sync error:", tutorId, error);
+      results.push({ tutor_id: tutorId, error: error.message });
+    }
+  }
+  return results;
+}
+
+async function syncAllTutorSchedules(env, horizonDays = 120) {
+  const tutors = await selectRows(env, "tutors", params => {
+    params.set("status", "eq.active");
+    params.set("cal_schedule_id", "not.is.null");
+  }, "id");
+  return syncTutorSchedules(env, tutors.map(tutor => tutor.id), horizonDays);
+}
+
+async function safeSyncAllTutorSchedules(env, horizonDays = 120) {
+  try {
+    return await syncAllTutorSchedules(env, horizonDays);
+  } catch (error) {
+    console.error("Cal availability bulk sync error:", error);
+    return [{ error: error.message }];
+  }
 }
 
 async function inviteTutor(env, email, name) {
@@ -807,13 +969,15 @@ async function replaceRegularLessonPlan(request, env, studentId) {
   const admin = await getSignedInUser(request, env);
   await assertAdmin(admin, env);
   const payload = regularLessonPlanPayload(await readJson(request));
+  const previousPlan = await selectOne(env, "regular_lesson_plans", { student_id: studentId, status: "active" }).catch(() => null);
   const planId = await callRpc(env, "edushot_admin_replace_regular_lesson_plan", {
     p_student_id: studentId,
     ...payload,
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  return { student_id: studentId, plan_id: planId };
+  const availabilitySync = await syncTutorSchedules(env, [previousPlan?.tutor_id, payload.p_tutor_id]);
+  return { student_id: studentId, plan_id: planId, availability_sync: availabilitySync };
 }
 
 async function endRegularLessonPlan(request, env, studentId) {
@@ -827,13 +991,15 @@ async function endRegularLessonPlan(request, env, studentId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
+  const previousPlan = await selectOne(env, "regular_lesson_plans", { student_id: studentId, status: "active" }).catch(() => null);
   await callRpc(env, "edushot_admin_end_regular_lesson_plan", {
     p_student_id: studentId,
     p_reason: reason,
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  return { student_id: studentId, status: "ended" };
+  const availabilitySync = await syncTutorSchedules(env, [previousPlan?.tutor_id]);
+  return { student_id: studentId, status: "ended", availability_sync: availabilitySync };
 }
 
 async function generateRegularLessons(request, env) {
@@ -849,7 +1015,8 @@ async function generateRegularLessons(request, env) {
   const result = await callRpc(env, "edushot_generate_all_regular_lessons", {
     p_horizon_days: horizonDays
   });
-  return result;
+  const availabilitySync = await safeSyncAllTutorSchedules(env, Math.min(366, Math.max(120, horizonDays)));
+  return { ...result, availability_sync: availabilitySync };
 }
 
 async function addRegularPlanBreak(request, env, planId) {
@@ -874,7 +1041,9 @@ async function addRegularPlanBreak(request, env, planId) {
     p_plan_id: planId, p_date_from: dateFrom, p_date_to: dateTo, p_reason: reason,
     p_actor_user_id: admin.id, p_actor_email: admin.email || null
   });
-  return { break_id: breakId, plan_id: planId };
+  const plan = await selectOne(env, "regular_lesson_plans", { id: planId }).catch(() => null);
+  const availabilitySync = await syncTutorSchedules(env, [plan?.tutor_id]);
+  return { break_id: breakId, plan_id: planId, availability_sync: availabilitySync };
 }
 
 async function substituteRegularLesson(request, env, lessonId) {
@@ -890,11 +1059,13 @@ async function substituteRegularLesson(request, env, lessonId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
+  const previousLesson = await selectOne(env, "lessons", { id: lessonId }).catch(() => null);
   await callRpc(env, "edushot_admin_substitute_regular_lesson", {
     p_lesson_id: lessonId, p_substitute_tutor_id: tutorId, p_reason: reason,
     p_actor_user_id: admin.id, p_actor_email: admin.email || null
   });
-  return { lesson_id: lessonId, tutor_id: tutorId };
+  const availabilitySync = await syncTutorSchedules(env, [previousLesson?.tutor_id, tutorId]);
+  return { lesson_id: lessonId, tutor_id: tutorId, availability_sync: availabilitySync };
 }
 
 async function substituteRegularOccurrence(request, env, occurrenceId) {
@@ -910,6 +1081,7 @@ async function substituteRegularOccurrence(request, env, occurrenceId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
+  const previousOccurrence = await selectOne(env, "regular_lesson_occurrences", { id: occurrenceId }).catch(() => null);
   const lessonId = await callRpc(env, "edushot_admin_substitute_regular_occurrence", {
     p_occurrence_id: occurrenceId,
     p_substitute_tutor_id: tutorId,
@@ -917,7 +1089,8 @@ async function substituteRegularOccurrence(request, env, occurrenceId) {
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId };
+  const availabilitySync = await syncTutorSchedules(env, [previousOccurrence?.assigned_tutor_id, tutorId]);
+  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId, availability_sync: availabilitySync };
 }
 
 async function addTutorTimeOff(request, env, tutorId) {
@@ -984,7 +1157,8 @@ async function addTutorTimeOff(request, env, tutorId) {
       entity_id: row.id,
       details: { tutor_id: tutorId, date_from: dateFrom, date_to: dateTo, reason }
     });
-    return row;
+    const availabilitySync = await syncTutorSchedules(env, [tutorId]);
+    return { ...row, availability_sync: availabilitySync };
   } catch (error) {
     try {
       await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
@@ -1039,7 +1213,8 @@ async function removeTutorTimeOff(request, env, timeOffId) {
       entity_id: timeOffId,
       details: { tutor_id: timeOff.tutor_id, date_from: timeOff.date_from, date_to: timeOff.date_to }
     });
-    return { id: timeOffId, deleted: true };
+    const availabilitySync = await syncTutorSchedules(env, [timeOff.tutor_id]);
+    return { id: timeOffId, deleted: true, availability_sync: availabilitySync };
   } catch (error) {
     try {
       await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
@@ -1053,7 +1228,71 @@ async function removeTutorTimeOff(request, env, timeOffId) {
   }
 }
 
+async function cancelLesson(request, env, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód anulowania lekcji."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const lesson = await selectOne(env, "lessons", { id: lessonId });
+  if (!lesson) {
+    throw Object.assign(new Error("Nie znaleziono lekcji."), {
+      status: 404, code: "LESSON_NOT_FOUND"
+    });
+  }
+  if (!["scheduled", "confirmed"].includes(lesson.status)) {
+    throw Object.assign(new Error("Można anulować tylko przyszłą, aktywną lekcję."), {
+      status: 409, code: "LESSON_NOT_CANCELLABLE"
+    });
+  }
+
+  if (lesson.provider === "cal.com" && lesson.provider_booking_id) {
+    await calRequest(env, `/v2/bookings/${encodeURIComponent(String(lesson.provider_booking_id))}`, {
+      method: "DELETE",
+      headers: { "cal-api-version": "2024-08-13" },
+      body: JSON.stringify({ cancellationReason: reason })
+    });
+  }
+
+  const result = await callRpc(env, "edushot_admin_cancel_lesson", {
+    p_lesson_id: lessonId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  const availabilitySync = lesson.regular_plan_id
+    ? await syncTutorSchedules(env, [lesson.tutor_id])
+    : [];
+  return { ...result, availability_sync: availabilitySync };
+}
+
+async function syncCalAvailability(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const horizonDays = Number(body.horizonDays ?? 120);
+  if (!Number.isInteger(horizonDays) || horizonDays < 7 || horizonDays > 366) {
+    throw Object.assign(new Error("Horyzont synchronizacji musi obejmować od 7 do 366 dni."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (tutorId) {
+    assertUuid(tutorId, "ID korepetytora");
+    return syncTutorSchedules(env, [tutorId], horizonDays);
+  }
+  return safeSyncAllTutorSchedules(env, horizonDays);
+}
+
 export default {
+  scheduled(_event, env, ctx) {
+    ctx.waitUntil(safeSyncAllTutorSchedules(env, 120));
+  },
   async fetch(request, env) {
     const url = new URL(request.url);
 
@@ -1090,6 +1329,21 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/admin/regular-plans/generate") {
         const data = await generateRegularLessons(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/cal-availability/sync") {
+        const data = await syncCalAvailability(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      const lessonCancelMatch = url.pathname.match(
+        /^\/api\/admin\/lessons\/([^/]+)\/cancel$/
+      );
+      if (request.method === "POST" && lessonCancelMatch) {
+        const data = await cancelLesson(
+          request, env, decodeURIComponent(lessonCancelMatch[1])
+        );
         return json(request, env, { ok: true, data });
       }
 
