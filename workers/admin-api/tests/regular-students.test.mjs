@@ -29,7 +29,7 @@ test("cancels a Cal.com lesson before the transactional database update", async 
       status: "scheduled", provider: "cal.com", provider_booking_id: "booking-uid", regular_plan_id: null
     }]);
     if (url === "https://api.cal.com/v2/bookings/booking-uid") return jsonResponse({ status: "cancelled" });
-    if (url.endsWith("/rest/v1/rpc/edushot_admin_cancel_lesson")) return jsonResponse({ lesson_id: "22222222-2222-4222-8222-222222222222", status: "cancelled" });
+    if (url.endsWith("/rest/v1/rpc/edushot_admin_cancel_lesson")) return jsonResponse({ lesson_id: "22222222-2222-4222-8222-222222222222", status: "cancelled_late", cancellation_hours: 24, tutor_compensated: true });
     throw new Error(`Unexpected request: ${url}`);
   };
   try {
@@ -43,6 +43,9 @@ test("cancels a Cal.com lesson before the transactional database update", async 
     assert.ok(calIndex >= 0 && rpcIndex > calIndex);
     assert.equal(calls[calIndex].init.method, "DELETE");
     assert.equal(JSON.parse(calls[calIndex].init.body).cancellationReason, "Odwołane organizacyjnie");
+    const body = await response.json();
+    assert.equal(body.data.status, "cancelled_late");
+    assert.equal(body.data.tutor_compensated, true);
   } finally { globalThis.fetch = originalFetch; }
 });
 
