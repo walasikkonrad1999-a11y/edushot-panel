@@ -19,6 +19,9 @@
  * DELETE /api/admin/tutor-time-off/:id
  * POST /api/admin/lessons/:id/cancel
  * POST /api/admin/cal-availability/sync
+ * GET  /api/admin/billing
+ * POST /api/admin/billing/payments/:id/verify
+ * POST /api/admin/billing/payments/:id/reverse
  * GET  /api/portal/workspace
  * POST /api/portal/lessons/:id/cancel
  * POST /api/portal/lessons/:id/reschedule-request
@@ -1436,6 +1439,69 @@ async function getPortalWorkspace(request, env) {
   };
 }
 
+async function getAdminBilling(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_all_guardian_billing", { p_period_start: isoMonthStart(now) }),
+    callRpc(env, "edushot_refresh_all_guardian_billing", { p_period_start: isoMonthStart(shiftUtcMonth(now, -1)) })
+  ]);
+  const [guardians, cycles, items, payments, allocations, requests] = await Promise.all([
+    selectRows(env, "guardians", params => params.set("order", "name.asc"), "id,name,email,phone"),
+    selectRows(env, "guardian_billing_cycles", params => {
+      params.set("order", "period_start.desc"); params.set("limit", "500");
+    }, "id,guardian_id,period_start,period_end,due_date,status,subtotal,adjustments_total,paid_total,balance_due,currency,opened_at,paid_at"),
+    selectRows(env, "guardian_billing_items", params => {
+      params.set("order", "service_date.desc"); params.set("limit", "1500");
+    }, "id,cycle_id,lesson_id,student_id,item_type,description,service_date,amount,status"),
+    selectRows(env, "guardian_payments", params => {
+      params.set("order", "created_at.desc"); params.set("limit", "500");
+    }, "id,guardian_id,method,status,amount,currency,provider,payer_reference,declared_at,received_at,verified_at,verified_by,note,created_at"),
+    selectRows(env, "guardian_payment_allocations", params => params.set("limit", "1500"), "payment_id,cycle_id,amount,created_at"),
+    selectRows(env, "guardian_portal_requests", params => {
+      params.set("order", "created_at.desc"); params.set("limit", "500");
+    }, "id,guardian_id,student_id,lesson_id,request_type,status,requested_payload,resolution_note,resolved_at,created_at")
+  ]);
+  return { guardians, cycles, items, payments, allocations, requests };
+}
+
+async function verifyGuardianPayment(request, env, paymentId) {
+  assertUuid(paymentId, "ID wpłaty");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const receivedAt = clean(body.receivedAt, 40);
+  const note = clean(body.note, 500);
+  if (receivedAt && !Number.isFinite(Date.parse(receivedAt))) {
+    throw Object.assign(new Error("Podaj prawidłową datę otrzymania wpłaty."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return callRpc(env, "edushot_admin_verify_guardian_payment", {
+    p_payment_id: paymentId,
+    p_received_at: receivedAt || null,
+    p_admin_note: note || null,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+}
+
+async function reverseGuardianPayment(request, env, paymentId) {
+  assertUuid(paymentId, "ID wpłaty");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód cofnięcia wpłaty."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return callRpc(env, "edushot_admin_reverse_guardian_payment", {
+    p_payment_id: paymentId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+}
+
 async function portalLessonOwnedBy(env, guardianId, lessonId) {
   assertUuid(lessonId, "ID lekcji");
   const lessons = await selectRows(env, "lessons", params => {
@@ -1601,6 +1667,22 @@ export default {
         return json(request, env, { ok: true, data });
       }
 
+      if (request.method === "GET" && url.pathname === "/api/admin/billing") {
+        const data = await getAdminBilling(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      const guardianPaymentMatch = url.pathname.match(
+        /^\/api\/admin\/billing\/payments\/([^/]+)\/(verify|reverse)$/
+      );
+      if (request.method === "POST" && guardianPaymentMatch) {
+        const paymentId = decodeURIComponent(guardianPaymentMatch[1]);
+        const data = guardianPaymentMatch[2] === "verify"
+          ? await verifyGuardianPayment(request, env, paymentId)
+          : await reverseGuardianPayment(request, env, paymentId);
+        return json(request, env, { ok: true, data });
+      }
+
       const lessonCancelMatch = url.pathname.match(
         /^\/api\/admin\/lessons\/([^/]+)\/cancel$/
       );
@@ -1739,5 +1821,4 @@ export default {
     }
   }
 };
-
 

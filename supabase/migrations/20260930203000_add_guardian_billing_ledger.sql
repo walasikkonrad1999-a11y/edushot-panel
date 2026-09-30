@@ -63,7 +63,7 @@ create table if not exists public.guardian_billing_items (
 );
 
 create unique index if not exists guardian_billing_items_lesson_uidx
-  on public.guardian_billing_items (lesson_id) where lesson_id is not null;
+  on public.guardian_billing_items (lesson_id);
 create index if not exists guardian_billing_cycles_guardian_status_idx
   on public.guardian_billing_cycles (guardian_id, status, period_start desc);
 create index if not exists guardian_billing_items_cycle_idx
@@ -344,4 +344,3 @@ comment on table public.guardian_billing_cycles is
   'Miesięczne, audytowalne rozliczenia rodziców. Kwoty wynikają z finansowego snapshotu lekcji.';
 comment on table public.guardian_payments is
   'Niezależny rejestr wpłat online, przelewów bankowych, korekt i zwrotów; nie zmienia wynagrodzenia tutora.';
-
