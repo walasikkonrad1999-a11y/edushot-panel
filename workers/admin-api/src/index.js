@@ -19,6 +19,10 @@
  * DELETE /api/admin/tutor-time-off/:id
  * POST /api/admin/lessons/:id/cancel
  * POST /api/admin/cal-availability/sync
+ * GET  /api/portal/workspace
+ * POST /api/portal/lessons/:id/cancel
+ * POST /api/portal/lessons/:id/reschedule-request
+ * POST /api/portal/bank-transfer-declarations
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -26,6 +30,7 @@
  * SUPABASE_SECRET_KEY
  * TUTOR_INVITE_REDIRECT
  * ALLOWED_ORIGINS
+ * PORTAL_SHARED_SECRET (wspólny wyłącznie dla serwera edushot.pl i tego API)
  *
  * SUPABASE_SECRET_KEY:
  * - najlepiej nowy klucz sb_secret_...
@@ -73,6 +78,68 @@ function json(request, env, body, status = 200) {
 
 function clean(value, max = 500) {
   return String(value ?? "").trim().slice(0, max);
+}
+
+function normalizedEmail(value) {
+  const email = clean(value, 254).toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw Object.assign(new Error("Nieprawidłowa tożsamość konta rodzica."), {
+      status: 401,
+      code: "PORTAL_AUTH_ERROR"
+    });
+  }
+  return email;
+}
+
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, "0")).join("");
+}
+
+function constantTimeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return mismatch === 0;
+}
+
+async function sha256(value) {
+  return bytesToHex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+}
+
+async function portalSignature(secret, value) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return bytesToHex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
+}
+
+async function assertPortalRequest(request, env, rawBody = "") {
+  if (!env.PORTAL_SHARED_SECRET || env.PORTAL_SHARED_SECRET.length < 32) {
+    throw Object.assign(new Error("Integracja portalu rodzica nie jest skonfigurowana."), {
+      status: 503,
+      code: "PORTAL_CONFIG_ERROR"
+    });
+  }
+  const email = normalizedEmail(request.headers.get("X-Edushot-Portal-Email"));
+  const timestamp = clean(request.headers.get("X-Edushot-Portal-Timestamp"), 20);
+  const supplied = clean(request.headers.get("X-Edushot-Portal-Signature"), 128).toLowerCase();
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60 * 1000) {
+    throw Object.assign(new Error("Żądanie portalu wygasło."), { status: 401, code: "PORTAL_AUTH_ERROR" });
+  }
+  const url = new URL(request.url);
+  const bodyHash = await sha256(rawBody);
+  const canonical = [request.method.toUpperCase(), url.pathname, timestamp, email, bodyHash].join("\n");
+  const expected = await portalSignature(env.PORTAL_SHARED_SECRET, canonical);
+  if (!/^[0-9a-f]{64}$/.test(supplied) || !constantTimeEqual(expected, supplied)) {
+    throw Object.assign(new Error("Nie udało się potwierdzić tożsamości portalu."), {
+      status: 401,
+      code: "PORTAL_AUTH_ERROR"
+    });
+  }
+  return email;
 }
 
 function cleanSlug(value) {
@@ -1266,6 +1333,196 @@ async function syncCalAvailability(request, env) {
   return syncEveryTutorCalSchedule(env, horizonDays);
 }
 
+function isoMonthStart(date = new Date()) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function shiftUtcMonth(date, offset) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + offset, 1));
+}
+
+function inFilter(values) {
+  return `in.(${values.map(value => `"${String(value).replaceAll('"', '')}"`).join(",")})`;
+}
+
+async function portalGuardian(env, email) {
+  const guardians = await selectRows(env, "guardians", params => {
+    params.set("email", `eq.${email}`);
+    params.set("limit", "1");
+  }, "id,name,email,phone");
+  const guardian = guardians[0];
+  if (!guardian) return null;
+  return guardian;
+}
+
+async function getPortalWorkspace(request, env) {
+  const email = await assertPortalRequest(request, env);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    return { guardian: null, students: [], plans: [], lessons: [], cycles: [], items: [], payments: [], requests: [] };
+  }
+
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id,
+      p_period_start: isoMonthStart(now)
+    }),
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id,
+      p_period_start: isoMonthStart(shiftUtcMonth(now, -1))
+    })
+  ]);
+
+  const links = await selectRows(env, "student_guardians", params => {
+    params.set("guardian_id", `eq.${guardian.id}`);
+  }, "student_id,is_primary,relationship");
+  const studentIds = links.map(link => link.student_id);
+  const [cycles, payments, requests] = await Promise.all([
+    selectRows(env, "guardian_billing_cycles", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "period_start.desc");
+      params.set("limit", "18");
+    }, "id,period_start,period_end,due_date,status,subtotal,adjustments_total,paid_total,balance_due,currency,opened_at,paid_at"),
+    selectRows(env, "guardian_payments", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "created_at.desc");
+      params.set("limit", "50");
+    }, "id,method,status,amount,currency,payer_reference,declared_at,received_at,verified_at,created_at"),
+    selectRows(env, "guardian_portal_requests", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "created_at.desc");
+      params.set("limit", "50");
+    }, "id,student_id,lesson_id,request_type,status,requested_payload,resolution_note,resolved_at,created_at")
+  ]);
+
+  if (!studentIds.length) {
+    return { guardian, students: [], plans: [], lessons: [], cycles, items: [], payments, requests };
+  }
+  const studentFilter = inFilter(studentIds);
+  const lessonFrom = isoMonthStart(shiftUtcMonth(now, -6));
+  const [students, plans, lessons] = await Promise.all([
+    selectRows(env, "students", params => {
+      params.set("id", studentFilter);
+      params.set("order", "name.asc");
+    }, "id,name,status,student_kind,started_on,ended_on"),
+    selectRows(env, "regular_lesson_plans", params => {
+      params.set("student_id", studentFilter);
+      params.set("order", "starts_on.desc");
+    }, "id,student_id,tutor_id,subject,level,duration_minutes,weekday,start_time,frequency,timezone,meet_url,starts_on,ends_on,status"),
+    selectRows(env, "lessons", params => {
+      params.set("student_id", studentFilter);
+      params.set("start_at", `gte.${lessonFrom}T00:00:00Z`);
+      params.set("order", "start_at.asc");
+      params.set("limit", "500");
+    }, "id,student_id,tutor_id,regular_plan_id,student_name,subject,level,start_at,end_at,duration_minutes,status,meet_url,cancelled_at,cancellation_notice_minutes,cancellation_refund_eligible")
+  ]);
+  const cycleIds = cycles.map(cycle => cycle.id);
+  const items = cycleIds.length ? await selectRows(env, "guardian_billing_items", params => {
+    params.set("cycle_id", inFilter(cycleIds));
+    params.set("order", "service_date.desc");
+  }, "id,cycle_id,lesson_id,student_id,item_type,description,service_date,amount,status") : [];
+  const tutorIds = [...new Set([...plans, ...lessons].map(row => row.tutor_id).filter(Boolean))];
+  const tutors = tutorIds.length ? await selectRows(env, "tutors", params => {
+    params.set("id", inFilter(tutorIds));
+  }, "id,name") : [];
+  const tutorNames = Object.fromEntries(tutors.map(tutor => [tutor.id, tutor.name]));
+  return {
+    guardian,
+    students,
+    plans: plans.map(plan => ({ ...plan, tutor_name: tutorNames[plan.tutor_id] || "Korepetytor EduSHOT" })),
+    lessons: lessons.map(lesson => ({ ...lesson, tutor_name: tutorNames[lesson.tutor_id] || "Korepetytor EduSHOT" })),
+    cycles, items, payments, requests
+  };
+}
+
+async function portalLessonOwnedBy(env, guardianId, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const lessons = await selectRows(env, "lessons", params => {
+    params.set("id", `eq.${lessonId}`);
+    params.set("limit", "1");
+  }, "id,student_id,start_at,status");
+  const lesson = lessons[0];
+  if (!lesson) return null;
+  const links = await selectRows(env, "student_guardians", params => {
+    params.set("guardian_id", `eq.${guardianId}`);
+    params.set("student_id", `eq.${lesson.student_id}`);
+    params.set("limit", "1");
+  }, "student_id");
+  return links.length ? lesson : null;
+}
+
+function parsePortalJson(rawBody) {
+  try { return rawBody ? JSON.parse(rawBody) : {}; }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowe dane formularza."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+}
+
+async function cancelPortalLesson(request, env, lessonId) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian || !await portalLessonOwnedBy(env, guardian.id, lessonId)) {
+    throw Object.assign(new Error("Nie znaleziono lekcji na tym koncie."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const reason = clean(body.reason, 500) || "Anulowanie zgłoszone w panelu rodzica";
+  return callRpc(env, "edushot_admin_cancel_lesson", {
+    p_lesson_id: lessonId,
+    p_reason: reason,
+    p_actor_user_id: null,
+    p_actor_email: `portal:${email}`
+  });
+}
+
+async function requestPortalReschedule(request, env, lessonId) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  const lesson = guardian && await portalLessonOwnedBy(env, guardian.id, lessonId);
+  if (!guardian || !lesson) {
+    throw Object.assign(new Error("Nie znaleziono lekcji na tym koncie."), { status: 404, code: "NOT_FOUND" });
+  }
+  if (new Date(lesson.start_at).getTime() <= Date.now()) {
+    throw Object.assign(new Error("Nie można przełożyć rozpoczętej lekcji."), { status: 409, code: "LESSON_ALREADY_STARTED" });
+  }
+  const body = parsePortalJson(rawBody);
+  const requestedStartAt = clean(body.requestedStartAt, 40);
+  const note = clean(body.note, 500);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  if (!idempotencyKey || (requestedStartAt && !Number.isFinite(Date.parse(requestedStartAt)))) {
+    throw Object.assign(new Error("Uzupełnij prawidłowe dane prośby o przełożenie."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return insertOne(env, "guardian_portal_requests", {
+    guardian_id: guardian.id,
+    student_id: lesson.student_id,
+    lesson_id: lessonId,
+    request_type: "reschedule",
+    requested_payload: { requested_start_at: requestedStartAt || null, note },
+    idempotency_key: idempotencyKey
+  });
+}
+
+async function declarePortalBankTransfer(request, env) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    throw Object.assign(new Error("Konto nie ma jeszcze stałych lekcji EduSHOT."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const amount = Number(body.amount);
+  const payerReference = clean(body.payerReference, 160);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  return callRpc(env, "edushot_declare_bank_transfer", {
+    p_guardian_id: guardian.id,
+    p_amount: amount,
+    p_payer_reference: payerReference,
+    p_idempotency_key: idempotencyKey
+  });
+}
+
 export default {
   scheduled(_event, env, ctx) {
     ctx.waitUntil(safeSyncAllTutorSchedules(env, 120));
@@ -1292,6 +1549,36 @@ export default {
             timestamp: new Date().toISOString()
           }
         });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/portal/workspace") {
+        const data = await getPortalWorkspace(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/portal/bank-transfer-declarations") {
+        const data = await declarePortalBankTransfer(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const portalLessonCancelMatch = url.pathname.match(
+        /^\/api\/portal\/lessons\/([^/]+)\/cancel$/
+      );
+      if (request.method === "POST" && portalLessonCancelMatch) {
+        const data = await cancelPortalLesson(
+          request, env, decodeURIComponent(portalLessonCancelMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const portalLessonRescheduleMatch = url.pathname.match(
+        /^\/api\/portal\/lessons\/([^/]+)\/reschedule-request$/
+      );
+      if (request.method === "POST" && portalLessonRescheduleMatch) {
+        const data = await requestPortalReschedule(
+          request, env, decodeURIComponent(portalLessonRescheduleMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/tutors") {
@@ -1452,4 +1739,5 @@ export default {
     }
   }
 };
+
 
