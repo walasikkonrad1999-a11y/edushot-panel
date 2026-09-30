@@ -14,6 +14,7 @@
  * POST /api/admin/regular-plans/generate
  * POST /api/admin/regular-plans/:id/breaks
  * POST /api/admin/regular-lessons/:id/substitute
+ * POST /api/admin/regular-occurrences/:id/substitute
  * POST /api/admin/tutors/:id/time-off
  * DELETE /api/admin/tutor-time-off/:id
  *
@@ -896,6 +897,29 @@ async function substituteRegularLesson(request, env, lessonId) {
   return { lesson_id: lessonId, tutor_id: tutorId };
 }
 
+async function substituteRegularOccurrence(request, env, occurrenceId) {
+  assertUuid(occurrenceId, "ID terminu planu");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const reason = clean(body.reason, 500);
+  assertUuid(tutorId, "ID korepetytora zastępującego");
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zastępstwa."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const lessonId = await callRpc(env, "edushot_admin_substitute_regular_occurrence", {
+    p_occurrence_id: occurrenceId,
+    p_substitute_tutor_id: tutorId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId };
+}
+
 async function addTutorTimeOff(request, env, tutorId) {
   assertUuid(tutorId, "ID korepetytora");
   const admin = await getSignedInUser(request, env);
@@ -1085,6 +1109,16 @@ export default {
       if (request.method === "POST" && regularLessonSubstituteMatch) {
         const data = await substituteRegularLesson(
           request, env, decodeURIComponent(regularLessonSubstituteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularOccurrenceSubstituteMatch = url.pathname.match(
+        /^\/api\/admin\/regular-occurrences\/([^/]+)\/substitute$/
+      );
+      if (request.method === "POST" && regularOccurrenceSubstituteMatch) {
+        const data = await substituteRegularOccurrence(
+          request, env, decodeURIComponent(regularOccurrenceSubstituteMatch[1])
         );
         return json(request, env, { ok: true, data });
       }

@@ -270,6 +270,33 @@ test("assigns a substitute only through the secured RPC", async () => {
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test("materializes a conflicted regular occurrence through the secured substitute RPC", async () => {
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input); calls.push({ url, init });
+    if (url.endsWith("/auth/v1/user")) return jsonResponse({ id: "11111111-1111-4111-8111-111111111111", email: "admin@edushot.pl" });
+    if (url.includes("/rest/v1/user_roles")) return jsonResponse([{ role: "admin" }]);
+    if (url.endsWith("/rest/v1/rpc/edushot_admin_substitute_regular_occurrence")) {
+      return jsonResponse("77777777-7777-4777-8777-777777777777");
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  try {
+    const response = await worker.fetch(new Request("https://api.example/api/admin/regular-occurrences/66666666-6666-4666-8666-666666666666/substitute", {
+      method: "POST", headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+      body: JSON.stringify({ tutorId: "44444444-4444-4444-8444-444444444444", reason: "Kolizja prowadzącego" })
+    }), env);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.data.lesson_id, "77777777-7777-4777-8777-777777777777");
+    const rpcCall = calls.find(call => call.url.endsWith("/rest/v1/rpc/edushot_admin_substitute_regular_occurrence"));
+    const payload = JSON.parse(rpcCall.init.body);
+    assert.equal(payload.p_occurrence_id, "66666666-6666-4666-8666-666666666666");
+    assert.equal(payload.p_substitute_tutor_id, "44444444-4444-4444-8444-444444444444");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("validates an administrator-managed tutor absence before Cal.com changes", async () => {
   const calls = [];
   const originalFetch = globalThis.fetch;
