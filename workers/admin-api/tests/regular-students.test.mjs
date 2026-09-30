@@ -196,6 +196,7 @@ test("replaces a regular lesson plan with validated scheduling data", async () =
     const payload = JSON.parse(rpcCall.init.body);
     assert.equal(payload.p_meet_url, "https://meet.google.com/abc-defg-hij");
     assert.equal(payload.p_weekday, 3);
+    assert.equal(calls.some(call => call.url.startsWith("https://api.cal.com")), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -377,13 +378,16 @@ test("adds tutor time off in Cal.com and Supabase through the admin API", async 
       return jsonResponse([{ user_id: "11111111-1111-4111-8111-111111111111", role: "admin" }]);
     }
     if (url.includes("/rest/v1/tutors?")) {
-      return jsonResponse([{ id: "22222222-2222-4222-8222-222222222222", name: "Tutor", status: "active", cal_schedule_id: "12345" }]);
+      return jsonResponse([{ id: "22222222-2222-4222-8222-222222222222", name: "Tutor", status: "active", cal_schedule_id: "12345", cal_regular_overrides_released_at: "2026-09-30T00:00:00Z" }]);
     }
     if (url === "https://api.cal.com/v2/schedules/12345" && (!init.method || init.method === "GET")) {
       return jsonResponse({ data: { overrides: [] } });
     }
     if (url === "https://api.cal.com/v2/schedules/12345" && init.method === "PATCH") {
       return jsonResponse({ data: { updated: true } });
+    }
+    if (url.includes("/rest/v1/tutor_time_off?")) {
+      return jsonResponse([{ date_from: "2026-10-10", date_to: "2026-10-11" }]);
     }
     if (url.endsWith("/rest/v1/tutor_time_off")) {
       return jsonResponse({ id: "33333333-3333-4333-8333-333333333333", tutor_id: "22222222-2222-4222-8222-222222222222" });

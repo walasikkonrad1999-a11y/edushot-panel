@@ -365,51 +365,6 @@ function addDateDays(dateKey, days) {
   return date.toISOString().slice(0, 10);
 }
 
-function timeToMinutes(value) {
-  const match = String(value || "").match(/^(\d{1,2}):(\d{2})/);
-  if (!match) return null;
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
-function minutesToTime(value) {
-  const minutes = Math.max(0, Math.min(1440, Number(value)));
-  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
-}
-
-function subtractBusyWindows(windows, busyWindows) {
-  const busy = busyWindows
-    .map(item => [timeToMinutes(item.start), timeToMinutes(item.end)])
-    .filter(([start, end]) => start !== null && end !== null && end > start)
-    .sort((a, b) => a[0] - b[0]);
-  return windows.flatMap(window => {
-    const start = timeToMinutes(window.start);
-    const end = timeToMinutes(window.end);
-    if (start === null || end === null || end <= start) return [];
-    let parts = [[start, end]];
-    for (const [busyStart, busyEnd] of busy) {
-      parts = parts.flatMap(([partStart, partEnd]) => {
-        if (busyEnd <= partStart || busyStart >= partEnd) return [[partStart, partEnd]];
-        const result = [];
-        if (busyStart > partStart) result.push([partStart, Math.min(busyStart, partEnd)]);
-        if (busyEnd < partEnd) result.push([Math.max(busyEnd, partStart), partEnd]);
-        return result;
-      });
-    }
-    return parts.filter(([partStart, partEnd]) => partEnd > partStart)
-      .map(([partStart, partEnd]) => ({ start: minutesToTime(partStart), end: minutesToTime(partEnd) }));
-  });
-}
-
-const CAL_WEEKDAY = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-
-function weeklyWindowsForDate(availability, dateKey) {
-  const weekday = CAL_WEEKDAY[new Date(`${dateKey}T12:00:00Z`).getUTCDay()];
-  return (Array.isArray(availability) ? availability : [])
-    .filter(item => Array.isArray(item?.days) && item.days.includes(weekday))
-    .map(item => ({ start: String(item.startTime || "").slice(0, 5), end: String(item.endTime || "").slice(0, 5) }))
-    .filter(item => timeToMinutes(item.start) !== null && timeToMinutes(item.end) > timeToMinutes(item.start));
-}
-
 async function syncTutorCalSchedule(env, tutorId, horizonDays = 120) {
   const tutor = await selectOne(env, "tutors", { id: tutorId });
   if (!tutor || tutor.status !== "active") return { tutor_id: tutorId, skipped: "inactive" };
@@ -417,14 +372,17 @@ async function syncTutorCalSchedule(env, tutorId, horizonDays = 120) {
 
   const today = warsawDateKey();
   const horizon = addDateDays(today, horizonDays);
+  const releaseLegacyRegularOverrides = !tutor.cal_regular_overrides_released_at;
   const [lessons, timeOff, current] = await Promise.all([
-    selectRows(env, "lessons", params => {
-      params.set("tutor_id", `eq.${tutorId}`);
-      params.set("regular_plan_id", "not.is.null");
-      params.set("status", "in.(scheduled,confirmed)");
-      params.set("lesson_date", `gte.${today}`);
-      params.append("lesson_date", `lte.${horizon}`);
-    }, "id,lesson_date,time_start,time_end"),
+    releaseLegacyRegularOverrides
+      ? selectRows(env, "lessons", params => {
+          params.set("tutor_id", `eq.${tutorId}`);
+          params.set("regular_plan_id", "not.is.null");
+          params.set("status", "in.(scheduled,confirmed)");
+          params.set("lesson_date", `gte.${today}`);
+          params.append("lesson_date", `lte.${horizon}`);
+        }, "id,lesson_date")
+      : Promise.resolve([]),
     selectRows(env, "tutor_time_off", params => {
       params.set("tutor_id", `eq.${tutorId}`);
       params.set("date_to", `gte.${today}`);
@@ -434,69 +392,102 @@ async function syncTutorCalSchedule(env, tutorId, horizonDays = 120) {
   ]);
 
   const schedule = current?.data || current || {};
-  const availability = Array.isArray(schedule.availability) ? schedule.availability : [];
   const existingOverrides = Array.isArray(schedule.overrides) ? schedule.overrides : [];
-  const generated = new Map();
+  const absenceDates = new Set();
 
   for (const absence of timeOff) {
     const from = absence.date_from < today ? today : absence.date_from;
     const to = absence.date_to > horizon ? horizon : absence.date_to;
-    for (const date of datesBetween(from, to)) generated.set(date, [{ date, startTime: "00:00", endTime: "00:00" }]);
+    for (const date of datesBetween(from, to)) absenceDates.add(date);
   }
 
-  const lessonsByDate = new Map();
-  for (const lesson of lessons) {
-    if (!lessonsByDate.has(lesson.lesson_date)) lessonsByDate.set(lesson.lesson_date, []);
-    lessonsByDate.get(lesson.lesson_date).push({ start: lesson.time_start, end: lesson.time_end });
-  }
-  for (const [date, busy] of lessonsByDate) {
-    if (generated.has(date)) continue;
-    const openWindows = subtractBusyWindows(weeklyWindowsForDate(availability, date), busy);
-    generated.set(date, openWindows.length
-      ? openWindows.map(window => ({ date, startTime: window.start, endTime: window.end }))
-      : [{ date, startTime: "00:00", endTime: "00:00" }]);
-  }
+  // Stałe lekcje nie zarządzają już dostępnością Cal.com. Jednorazowo
+  // usuwamy stare nadpisania na ich datach, a później automatycznie
+  // utrzymujemy tylko pełnodniowe nieobecności zapisane przez administrację.
+  const legacyRegularDates = new Set(lessons.map(lesson => lesson.lesson_date));
 
   const preserved = existingOverrides.filter(item => {
     const date = String(item?.date || "");
-    return !/^\d{4}-\d{2}-\d{2}$/.test(date) || date < today || date > horizon;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < today || date > horizon) return true;
+    if (absenceDates.has(date)) return false;
+    if (releaseLegacyRegularOverrides && legacyRegularDates.has(date)) return false;
+    return true;
   });
-  const overrides = [...preserved, ...[...generated.values()].flat()]
+  const absenceOverrides = [...absenceDates].map(date => ({
+    date, startTime: "00:00", endTime: "00:00"
+  }));
+  const overrides = [...preserved, ...absenceOverrides]
     .sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.startTime).localeCompare(String(b.startTime)));
-  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
-    method: "PATCH", body: JSON.stringify({ overrides })
-  });
-  return { tutor_id: tutorId, blocked_dates: generated.size, lessons: lessons.length, time_off: timeOff.length };
+  if (JSON.stringify(overrides) !== JSON.stringify(existingOverrides)) {
+    await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+      method: "PATCH", body: JSON.stringify({ overrides })
+    });
+  }
+  if (releaseLegacyRegularOverrides) {
+    await updateOne(env, "tutors", tutorId, {
+      cal_regular_overrides_released_at: new Date().toISOString()
+    });
+  }
+  return {
+    tutor_id: tutorId,
+    blocked_absence_dates: absenceDates.size,
+    released_regular_dates: legacyRegularDates.size,
+    time_off: timeOff.length
+  };
 }
 
 async function syncTutorSchedules(env, tutorIds, horizonDays = 120) {
   const results = [];
-  for (const tutorId of [...new Set(tutorIds.filter(Boolean))]) {
-    try {
-      results.push(await syncTutorCalSchedule(env, tutorId, horizonDays));
-    } catch (error) {
-      console.error("Cal availability sync error:", tutorId, error);
-      results.push({ tutor_id: tutorId, error: error.message });
-    }
+  const ids = [...new Set(tutorIds.filter(Boolean))];
+  for (let index = 0; index < ids.length; index += 5) {
+    const batch = ids.slice(index, index + 5);
+    const batchResults = await Promise.all(batch.map(async tutorId => {
+      try {
+        return await syncTutorCalSchedule(env, tutorId, horizonDays);
+      } catch (error) {
+        console.error(JSON.stringify({ message: "Cal absence sync failed", tutor_id: tutorId, error: error.message }));
+        return { tutor_id: tutorId, error: error.message };
+      }
+    }));
+    results.push(...batchResults);
   }
   return results;
 }
 
 async function syncAllTutorSchedules(env, horizonDays = 120) {
-  const tutors = await selectRows(env, "tutors", params => {
-    params.set("status", "eq.active");
-    params.set("cal_schedule_id", "not.is.null");
-  }, "id");
-  return syncTutorSchedules(env, tutors.map(tutor => tutor.id), horizonDays);
+  const today = warsawDateKey();
+  const [legacyTutors, activeTimeOff] = await Promise.all([
+    selectRows(env, "tutors", params => {
+      params.set("status", "eq.active");
+      params.set("cal_schedule_id", "not.is.null");
+      params.set("cal_regular_overrides_released_at", "is.null");
+    }, "id"),
+    selectRows(env, "tutor_time_off", params => {
+      params.set("date_to", `gte.${today}`);
+    }, "tutor_id")
+  ]);
+  const tutorIds = [...new Set([
+    ...legacyTutors.map(tutor => tutor.id),
+    ...activeTimeOff.map(item => item.tutor_id)
+  ].filter(Boolean))];
+  return syncTutorSchedules(env, tutorIds, horizonDays);
 }
 
 async function safeSyncAllTutorSchedules(env, horizonDays = 120) {
   try {
     return await syncAllTutorSchedules(env, horizonDays);
   } catch (error) {
-    console.error("Cal availability bulk sync error:", error);
+    console.error(JSON.stringify({ message: "Cal absence bulk sync failed", error: error.message }));
     return [{ error: error.message }];
   }
+}
+
+async function syncEveryTutorCalSchedule(env, horizonDays = 120) {
+  const tutors = await selectRows(env, "tutors", params => {
+    params.set("status", "eq.active");
+    params.set("cal_schedule_id", "not.is.null");
+  }, "id");
+  return syncTutorSchedules(env, tutors.map(tutor => tutor.id), horizonDays);
 }
 
 async function inviteTutor(env, email, name) {
@@ -969,15 +960,13 @@ async function replaceRegularLessonPlan(request, env, studentId) {
   const admin = await getSignedInUser(request, env);
   await assertAdmin(admin, env);
   const payload = regularLessonPlanPayload(await readJson(request));
-  const previousPlan = await selectOne(env, "regular_lesson_plans", { student_id: studentId, status: "active" }).catch(() => null);
   const planId = await callRpc(env, "edushot_admin_replace_regular_lesson_plan", {
     p_student_id: studentId,
     ...payload,
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  const availabilitySync = await syncTutorSchedules(env, [previousPlan?.tutor_id, payload.p_tutor_id]);
-  return { student_id: studentId, plan_id: planId, availability_sync: availabilitySync };
+  return { student_id: studentId, plan_id: planId };
 }
 
 async function endRegularLessonPlan(request, env, studentId) {
@@ -991,15 +980,13 @@ async function endRegularLessonPlan(request, env, studentId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
-  const previousPlan = await selectOne(env, "regular_lesson_plans", { student_id: studentId, status: "active" }).catch(() => null);
   await callRpc(env, "edushot_admin_end_regular_lesson_plan", {
     p_student_id: studentId,
     p_reason: reason,
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  const availabilitySync = await syncTutorSchedules(env, [previousPlan?.tutor_id]);
-  return { student_id: studentId, status: "ended", availability_sync: availabilitySync };
+  return { student_id: studentId, status: "ended" };
 }
 
 async function generateRegularLessons(request, env) {
@@ -1015,8 +1002,7 @@ async function generateRegularLessons(request, env) {
   const result = await callRpc(env, "edushot_generate_all_regular_lessons", {
     p_horizon_days: horizonDays
   });
-  const availabilitySync = await safeSyncAllTutorSchedules(env, Math.min(366, Math.max(120, horizonDays)));
-  return { ...result, availability_sync: availabilitySync };
+  return result;
 }
 
 async function addRegularPlanBreak(request, env, planId) {
@@ -1041,9 +1027,7 @@ async function addRegularPlanBreak(request, env, planId) {
     p_plan_id: planId, p_date_from: dateFrom, p_date_to: dateTo, p_reason: reason,
     p_actor_user_id: admin.id, p_actor_email: admin.email || null
   });
-  const plan = await selectOne(env, "regular_lesson_plans", { id: planId }).catch(() => null);
-  const availabilitySync = await syncTutorSchedules(env, [plan?.tutor_id]);
-  return { break_id: breakId, plan_id: planId, availability_sync: availabilitySync };
+  return { break_id: breakId, plan_id: planId };
 }
 
 async function substituteRegularLesson(request, env, lessonId) {
@@ -1059,13 +1043,11 @@ async function substituteRegularLesson(request, env, lessonId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
-  const previousLesson = await selectOne(env, "lessons", { id: lessonId }).catch(() => null);
   await callRpc(env, "edushot_admin_substitute_regular_lesson", {
     p_lesson_id: lessonId, p_substitute_tutor_id: tutorId, p_reason: reason,
     p_actor_user_id: admin.id, p_actor_email: admin.email || null
   });
-  const availabilitySync = await syncTutorSchedules(env, [previousLesson?.tutor_id, tutorId]);
-  return { lesson_id: lessonId, tutor_id: tutorId, availability_sync: availabilitySync };
+  return { lesson_id: lessonId, tutor_id: tutorId };
 }
 
 async function substituteRegularOccurrence(request, env, occurrenceId) {
@@ -1081,7 +1063,6 @@ async function substituteRegularOccurrence(request, env, occurrenceId) {
       status: 400, code: "VALIDATION_ERROR"
     });
   }
-  const previousOccurrence = await selectOne(env, "regular_lesson_occurrences", { id: occurrenceId }).catch(() => null);
   const lessonId = await callRpc(env, "edushot_admin_substitute_regular_occurrence", {
     p_occurrence_id: occurrenceId,
     p_substitute_tutor_id: tutorId,
@@ -1089,8 +1070,7 @@ async function substituteRegularOccurrence(request, env, occurrenceId) {
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  const availabilitySync = await syncTutorSchedules(env, [previousOccurrence?.assigned_tutor_id, tutorId]);
-  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId, availability_sync: availabilitySync };
+  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId };
 }
 
 async function addTutorTimeOff(request, env, tutorId) {
@@ -1265,10 +1245,7 @@ async function cancelLesson(request, env, lessonId) {
     p_actor_user_id: admin.id,
     p_actor_email: admin.email || null
   });
-  const availabilitySync = lesson.regular_plan_id
-    ? await syncTutorSchedules(env, [lesson.tutor_id])
-    : [];
-  return { ...result, availability_sync: availabilitySync };
+  return result;
 }
 
 async function syncCalAvailability(request, env) {
@@ -1286,7 +1263,7 @@ async function syncCalAvailability(request, env) {
     assertUuid(tutorId, "ID korepetytora");
     return syncTutorSchedules(env, [tutorId], horizonDays);
   }
-  return safeSyncAllTutorSchedules(env, horizonDays);
+  return syncEveryTutorCalSchedule(env, horizonDays);
 }
 
 export default {
