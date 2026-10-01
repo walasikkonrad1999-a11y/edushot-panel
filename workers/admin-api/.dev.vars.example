@@ -1,0 +1,10 @@
+SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_REPLACE_ME
+SUPABASE_SECRET_KEY=sb_secret_REPLACE_ME
+TUTOR_INVITE_REDIRECT=http://localhost:8787/tutor
+ALLOWED_ORIGINS=http://localhost:8787
+PORTAL_SHARED_SECRET=replace-with-at-least-32-random-characters
+PORTAL_RETURN_URL=https://edushot.pl/moje-konto
+STRIPE_SECRET_KEY=sk_test_REPLACE_ME
+STRIPE_WEBHOOK_SECRET=whsec_REPLACE_ME
+

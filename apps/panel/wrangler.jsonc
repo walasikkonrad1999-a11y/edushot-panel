@@ -1,9 +1,13 @@
 {
   "name": "panel",
   "compatibility_date": "2026-09-30",
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "assets": {
-    "directory": ".",
+    "directory": "./public",
     "html_handling": "drop-trailing-slash"
+  },
+  "observability": {
+    "enabled": true
   }
 }

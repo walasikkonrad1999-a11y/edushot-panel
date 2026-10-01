@@ -1,0 +1,2003 @@
+/**
+ * EduSHOT Admin API — Cloudflare Worker
+ *
+ * Endpointy:
+ * GET  /api/health
+ * POST /api/admin/tutors
+ * DELETE /api/admin/tutors/:id
+ * POST /api/admin/regular-students
+ * PATCH /api/admin/regular-students/:id
+ * DELETE /api/admin/regular-students/:id
+ * POST /api/admin/regular-students/:id/reactivate
+ * PUT  /api/admin/regular-students/:id/plan
+ * DELETE /api/admin/regular-students/:id/plan
+ * POST /api/admin/regular-plans/generate
+ * POST /api/admin/regular-plans/:id/breaks
+ * POST /api/admin/regular-lessons/:id/substitute
+ * POST /api/admin/regular-occurrences/:id/substitute
+ * POST /api/admin/tutors/:id/time-off
+ * DELETE /api/admin/tutor-time-off/:id
+ * POST /api/admin/lessons/:id/cancel
+ * POST /api/admin/cal-availability/sync
+ * GET  /api/admin/billing
+ * POST /api/admin/billing/payments/:id/verify
+ * POST /api/admin/billing/payments/:id/reverse
+ * GET  /api/portal/workspace
+ * POST /api/portal/lessons/:id/cancel
+ * POST /api/portal/lessons/:id/reschedule-request
+ * POST /api/portal/bank-transfer-declarations
+ * POST /api/portal/checkout-sessions
+ * POST /api/webhook/stripe
+ *
+ * Wymagane Variables / Secrets w Cloudflare:
+ * SUPABASE_URL
+ * SUPABASE_PUBLISHABLE_KEY lub SUPABASE_ANON_KEY
+ * SUPABASE_SECRET_KEY
+ * TUTOR_INVITE_REDIRECT
+ * ALLOWED_ORIGINS
+ * PORTAL_SHARED_SECRET (wspólny wyłącznie dla serwera edushot.pl i tego API)
+ * PORTAL_RETURN_URL (adres panelu rodzica po zakończeniu Stripe Checkout)
+ * STRIPE_SECRET_KEY
+ * STRIPE_WEBHOOK_SECRET
+ *
+ * SUPABASE_SECRET_KEY:
+ * - najlepiej nowy klucz sb_secret_...
+ * - legacy service_role nadal jest obsługiwany przez ten plik
+ *
+ * NIGDY nie umieszczaj SUPABASE_SECRET_KEY w admin.html/korki.html/GitHubie.
+ */
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://panel.edushot.workers.dev"
+];
+const CAL_API_VERSION = "2024-06-11";
+
+function getAllowedOrigins(env) {
+  return (env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(","))
+    .split(",")
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+function corsHeaders(request, env) {
+  const origin = request.headers.get("Origin") || "";
+  const allowed = getAllowedOrigins(env);
+  const allowOrigin = allowed.includes(origin) ? origin : allowed[0];
+
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin"
+  };
+}
+
+function json(request, env, body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...corsHeaders(request, env),
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
+}
+
+function clean(value, max = 500) {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function normalizedEmail(value) {
+  const email = clean(value, 254).toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw Object.assign(new Error("Nieprawidłowa tożsamość konta rodzica."), {
+      status: 401,
+      code: "PORTAL_AUTH_ERROR"
+    });
+  }
+  return email;
+}
+
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, "0")).join("");
+}
+
+function constantTimeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return mismatch === 0;
+}
+
+async function sha256(value) {
+  return bytesToHex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+}
+
+async function portalSignature(secret, value) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return bytesToHex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
+}
+
+async function hmacSha256(secret, value) {
+  return portalSignature(secret, value);
+}
+
+function assertStripeConfig(env, mode = "checkout") {
+  const missing = [];
+  if (mode === "checkout" && !env.STRIPE_SECRET_KEY) missing.push("STRIPE_SECRET_KEY");
+  if (mode === "checkout" && !env.PORTAL_RETURN_URL) missing.push("PORTAL_RETURN_URL");
+  if (mode === "webhook" && !env.STRIPE_WEBHOOK_SECRET) missing.push("STRIPE_WEBHOOK_SECRET");
+  if (missing.length) {
+    throw Object.assign(new Error(`Płatności online nie są jeszcze skonfigurowane: ${missing.join(", ")}.`), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+}
+
+async function assertStripeWebhook(request, env, rawBody) {
+  assertStripeConfig(env, "webhook");
+  const signature = request.headers.get("Stripe-Signature") || "";
+  const parts = signature.split(",").map(part => part.trim().split("=", 2));
+  const timestamp = parts.find(([key]) => key === "t")?.[1] || "";
+  const candidates = parts.filter(([key]) => key === "v1").map(([, value]) => value || "");
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60 * 1000) {
+    throw Object.assign(new Error("Webhook Stripe wygasł."), { status: 400, code: "STRIPE_SIGNATURE_ERROR" });
+  }
+  const expected = await hmacSha256(env.STRIPE_WEBHOOK_SECRET, `${timestamp}.${rawBody}`);
+  if (!candidates.some(candidate => /^[0-9a-f]{64}$/i.test(candidate) && constantTimeEqual(expected, candidate.toLowerCase()))) {
+    throw Object.assign(new Error("Nieprawidłowy podpis webhooka Stripe."), { status: 400, code: "STRIPE_SIGNATURE_ERROR" });
+  }
+}
+
+async function assertPortalRequest(request, env, rawBody = "") {
+  if (!env.PORTAL_SHARED_SECRET || env.PORTAL_SHARED_SECRET.length < 32) {
+    throw Object.assign(new Error("Integracja portalu rodzica nie jest skonfigurowana."), {
+      status: 503,
+      code: "PORTAL_CONFIG_ERROR"
+    });
+  }
+  const email = normalizedEmail(request.headers.get("X-Edushot-Portal-Email"));
+  const timestamp = clean(request.headers.get("X-Edushot-Portal-Timestamp"), 20);
+  const supplied = clean(request.headers.get("X-Edushot-Portal-Signature"), 128).toLowerCase();
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60 * 1000) {
+    throw Object.assign(new Error("Żądanie portalu wygasło."), { status: 401, code: "PORTAL_AUTH_ERROR" });
+  }
+  const url = new URL(request.url);
+  const bodyHash = await sha256(rawBody);
+  const canonical = [request.method.toUpperCase(), url.pathname, timestamp, email, bodyHash].join("\n");
+  const expected = await portalSignature(env.PORTAL_SHARED_SECRET, canonical);
+  if (!/^[0-9a-f]{64}$/.test(supplied) || !constantTimeEqual(expected, supplied)) {
+    throw Object.assign(new Error("Nie udało się potwierdzić tożsamości portalu."), {
+      status: 401,
+      code: "PORTAL_AUTH_ERROR"
+    });
+  }
+  return email;
+}
+
+function cleanSlug(value) {
+  return clean(value, 120)
+    .replace(/^https?:\/\/(www\.)?cal\.com\//i, "")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+function isLegacyJwtKey(key) {
+  return typeof key === "string" && key.startsWith("eyJ");
+}
+
+function getPublishableKey(env) {
+  return env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY || "";
+}
+
+function adminHeaders(env, extra = {}) {
+  const headers = {
+    "apikey": env.SUPABASE_SECRET_KEY,
+    ...extra
+  };
+
+  // Legacy service_role jest JWT i może iść jako Bearer.
+  // Nowy sb_secret_* powinien być przekazywany jako apikey.
+  if (isLegacyJwtKey(env.SUPABASE_SECRET_KEY)) {
+    headers["Authorization"] = `Bearer ${env.SUPABASE_SECRET_KEY}`;
+  }
+
+  return headers;
+}
+
+function assertConfig(env) {
+  const missing = [];
+  if (!env.SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!getPublishableKey(env)) {
+    missing.push("SUPABASE_PUBLISHABLE_KEY lub SUPABASE_ANON_KEY");
+  }
+  if (!env.SUPABASE_SECRET_KEY) missing.push("SUPABASE_SECRET_KEY");
+
+  if (missing.length) {
+    throw Object.assign(
+      new Error(`Brak konfiguracji Workera: ${missing.join(", ")}`),
+      { status: 500, code: "CONFIG_ERROR" }
+    );
+  }
+}
+
+async function getSignedInUser(request, env) {
+  const authHeader = request.headers.get("Authorization") || "";
+
+  if (!authHeader.startsWith("Bearer ")) {
+    throw Object.assign(new Error("Brak sesji administratora."), {
+      status: 401,
+      code: "AUTH_ERROR"
+    });
+  }
+
+  const accessToken = authHeader.slice(7).trim();
+
+  const response = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      "apikey": getPublishableKey(env),
+      "Authorization": `Bearer ${accessToken}`
+    }
+  });
+
+  if (!response.ok) {
+    throw Object.assign(
+      new Error("Sesja administratora wygasła lub jest nieprawidłowa."),
+      { status: 401, code: "AUTH_ERROR" }
+    );
+  }
+
+  return await response.json();
+}
+
+async function assertAdmin(user, env) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/user_roles`);
+  url.searchParams.set("select", "user_id,role");
+  url.searchParams.set("user_id", `eq.${user.id}`);
+  url.searchParams.set("role", "eq.admin");
+  url.searchParams.set("limit", "1");
+
+  const response = await fetch(url.toString(), {
+    headers: adminHeaders(env, { "Accept": "application/json" })
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    console.error("Admin role check:", response.status, details);
+
+    throw Object.assign(
+      new Error("Nie udało się zweryfikować uprawnień administratora."),
+      { status: 500, code: "ROLE_CHECK_ERROR" }
+    );
+  }
+
+  const rows = await response.json();
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw Object.assign(
+      new Error("To konto nie ma uprawnień administratora."),
+      { status: 403, code: "FORBIDDEN" }
+    );
+  }
+}
+
+async function selectOne(env, table, filters) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("select", "*");
+  url.searchParams.set("limit", "1");
+
+  for (const [key, value] of Object.entries(filters)) {
+    url.searchParams.set(key, `eq.${value}`);
+  }
+
+  const response = await fetch(url.toString(), {
+    headers: adminHeaders(env, { "Accept": "application/json" })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Błąd odczytu tabeli ${table}: ${await response.text()}`);
+  }
+
+  const rows = await response.json();
+  return rows?.[0] || null;
+}
+
+async function selectRows(env, table, configure, select = "*") {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("select", select);
+  if (typeof configure === "function") configure(url.searchParams);
+  const response = await fetch(url.toString(), {
+    headers: adminHeaders(env, { "Accept": "application/json" })
+  });
+  if (!response.ok) {
+    throw new Error(`Błąd odczytu tabeli ${table}: ${await response.text()}`);
+  }
+  const rows = await response.json();
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function insertOne(env, table, row) {
+  const response = await fetch(`${env.SUPABASE_URL}/rest/v1/${table}`, {
+    method: "POST",
+    headers: adminHeaders(env, {
+      "Content-Type": "application/json",
+      "Accept": "application/vnd.pgrst.object+json",
+      "Prefer": "return=representation"
+    }),
+    body: JSON.stringify(row)
+  });
+
+  const raw = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Błąd zapisu tabeli ${table}: ${raw}`);
+  }
+
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function updateOne(env, table, id, row) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  url.searchParams.set("id", `eq.${id}`);
+
+  const response = await fetch(url.toString(), {
+    method: "PATCH",
+    headers: adminHeaders(env, {
+      "Content-Type": "application/json",
+      "Accept": "application/vnd.pgrst.object+json",
+      "Prefer": "return=representation"
+    }),
+    body: JSON.stringify(row)
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(`Błąd aktualizacji tabeli ${table}: ${raw}`);
+  }
+
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function callRpc(env, functionName, payload) {
+  const response = await fetch(
+    `${env.SUPABASE_URL}/rest/v1/rpc/${functionName}`,
+    {
+      method: "POST",
+      headers: adminHeaders(env, {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      }),
+      body: JSON.stringify(payload)
+    }
+  );
+
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {}
+
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(data?.message || raw || "Nie udało się zapisać danych."),
+      {
+        status: response.status >= 500 ? 500 : 400,
+        code: data?.code || "DATABASE_ERROR"
+      }
+    );
+  }
+
+  return data;
+}
+
+async function deleteRows(env, table, filters) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+
+  for (const [key, value] of Object.entries(filters)) {
+    url.searchParams.set(key, `eq.${value}`);
+  }
+
+  const response = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: adminHeaders(env)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Błąd usuwania z tabeli ${table}: ${await response.text()}`);
+  }
+}
+
+async function calRequest(env, endpoint, options = {}) {
+  if (!env.CAL_API_KEY) {
+    throw Object.assign(new Error("Brak konfiguracji Cal.com w API administratora."), {
+      status: 500,
+      code: "CAL_CONFIG_ERROR"
+    });
+  }
+
+  const response = await fetch(`https://api.cal.com${endpoint}`, {
+    ...options,
+    headers: {
+      "Authorization": `Bearer ${env.CAL_API_KEY}`,
+      "cal-api-version": CAL_API_VERSION,
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const raw = await response.text();
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
+  if (!response.ok) {
+    throw Object.assign(new Error(`Cal.com: ${data?.error?.message || data?.message || raw || `HTTP ${response.status}`}`), {
+      status: 502,
+      code: "CAL_API_ERROR"
+    });
+  }
+  return data;
+}
+
+function datesBetween(start, end) {
+  const current = new Date(`${start}T12:00:00Z`);
+  const last = new Date(`${end}T12:00:00Z`);
+  const dates = [];
+  if (Number.isNaN(current.getTime()) || Number.isNaN(last.getTime()) || current > last) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  while (current <= last) {
+    dates.push(current.toISOString().slice(0, 10));
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  return dates;
+}
+
+function warsawDateKey(date = new Date()) {
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Warsaw", year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(date);
+}
+
+function addDateDays(dateKey, days) {
+  const date = new Date(`${dateKey}T12:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+async function syncTutorCalSchedule(env, tutorId, horizonDays = 120) {
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status !== "active") return { tutor_id: tutorId, skipped: "inactive" };
+  if (!tutor.cal_schedule_id) return { tutor_id: tutorId, skipped: "missing_schedule_id" };
+
+  const today = warsawDateKey();
+  const horizon = addDateDays(today, horizonDays);
+  const releaseLegacyRegularOverrides = !tutor.cal_regular_overrides_released_at;
+  const [lessons, timeOff, current] = await Promise.all([
+    releaseLegacyRegularOverrides
+      ? selectRows(env, "lessons", params => {
+          params.set("tutor_id", `eq.${tutorId}`);
+          params.set("regular_plan_id", "not.is.null");
+          params.set("status", "in.(scheduled,confirmed)");
+          params.set("lesson_date", `gte.${today}`);
+          params.append("lesson_date", `lte.${horizon}`);
+        }, "id,lesson_date")
+      : Promise.resolve([]),
+    selectRows(env, "tutor_time_off", params => {
+      params.set("tutor_id", `eq.${tutorId}`);
+      params.set("date_to", `gte.${today}`);
+      params.set("date_from", `lte.${horizon}`);
+    }, "date_from,date_to"),
+    calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" })
+  ]);
+
+  const schedule = current?.data || current || {};
+  const existingOverrides = Array.isArray(schedule.overrides) ? schedule.overrides : [];
+  const absenceDates = new Set();
+
+  for (const absence of timeOff) {
+    const from = absence.date_from < today ? today : absence.date_from;
+    const to = absence.date_to > horizon ? horizon : absence.date_to;
+    for (const date of datesBetween(from, to)) absenceDates.add(date);
+  }
+
+  // Stałe lekcje nie zarządzają już dostępnością Cal.com. Jednorazowo
+  // usuwamy stare nadpisania na ich datach, a później automatycznie
+  // utrzymujemy tylko pełnodniowe nieobecności zapisane przez administrację.
+  const legacyRegularDates = new Set(lessons.map(lesson => lesson.lesson_date));
+
+  const preserved = existingOverrides.filter(item => {
+    const date = String(item?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < today || date > horizon) return true;
+    if (absenceDates.has(date)) return false;
+    if (releaseLegacyRegularOverrides && legacyRegularDates.has(date)) return false;
+    return true;
+  });
+  const absenceOverrides = [...absenceDates].map(date => ({
+    date, startTime: "00:00", endTime: "00:00"
+  }));
+  const overrides = [...preserved, ...absenceOverrides]
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.startTime).localeCompare(String(b.startTime)));
+  if (JSON.stringify(overrides) !== JSON.stringify(existingOverrides)) {
+    await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+      method: "PATCH", body: JSON.stringify({ overrides })
+    });
+  }
+  if (releaseLegacyRegularOverrides) {
+    await updateOne(env, "tutors", tutorId, {
+      cal_regular_overrides_released_at: new Date().toISOString()
+    });
+  }
+  return {
+    tutor_id: tutorId,
+    blocked_absence_dates: absenceDates.size,
+    released_regular_dates: legacyRegularDates.size,
+    time_off: timeOff.length
+  };
+}
+
+async function syncTutorSchedules(env, tutorIds, horizonDays = 120) {
+  const results = [];
+  const ids = [...new Set(tutorIds.filter(Boolean))];
+  for (let index = 0; index < ids.length; index += 5) {
+    const batch = ids.slice(index, index + 5);
+    const batchResults = await Promise.all(batch.map(async tutorId => {
+      try {
+        return await syncTutorCalSchedule(env, tutorId, horizonDays);
+      } catch (error) {
+        console.error(JSON.stringify({ message: "Cal absence sync failed", tutor_id: tutorId, error: error.message }));
+        return { tutor_id: tutorId, error: error.message };
+      }
+    }));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+async function syncAllTutorSchedules(env, horizonDays = 120) {
+  const today = warsawDateKey();
+  const [legacyTutors, activeTimeOff] = await Promise.all([
+    selectRows(env, "tutors", params => {
+      params.set("status", "eq.active");
+      params.set("cal_schedule_id", "not.is.null");
+      params.set("cal_regular_overrides_released_at", "is.null");
+    }, "id"),
+    selectRows(env, "tutor_time_off", params => {
+      params.set("date_to", `gte.${today}`);
+    }, "tutor_id")
+  ]);
+  const tutorIds = [...new Set([
+    ...legacyTutors.map(tutor => tutor.id),
+    ...activeTimeOff.map(item => item.tutor_id)
+  ].filter(Boolean))];
+  return syncTutorSchedules(env, tutorIds, horizonDays);
+}
+
+async function safeSyncAllTutorSchedules(env, horizonDays = 120) {
+  try {
+    return await syncAllTutorSchedules(env, horizonDays);
+  } catch (error) {
+    console.error(JSON.stringify({ message: "Cal absence bulk sync failed", error: error.message }));
+    return [{ error: error.message }];
+  }
+}
+
+async function syncEveryTutorCalSchedule(env, horizonDays = 120) {
+  const tutors = await selectRows(env, "tutors", params => {
+    params.set("status", "eq.active");
+    params.set("cal_schedule_id", "not.is.null");
+  }, "id");
+  return syncTutorSchedules(env, tutors.map(tutor => tutor.id), horizonDays);
+}
+
+async function inviteTutor(env, email, name) {
+  const url = new URL(`${env.SUPABASE_URL}/auth/v1/invite`);
+
+  if (env.TUTOR_INVITE_REDIRECT) {
+    url.searchParams.set("redirect_to", env.TUTOR_INVITE_REDIRECT);
+  }
+
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers: adminHeaders(env, {
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    }),
+    body: JSON.stringify({
+      email,
+      data: {
+        name,
+        role: "tutor"
+      }
+    })
+  });
+
+  const raw = await response.text();
+
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {}
+
+  if (!response.ok) {
+    const message =
+      data?.msg ||
+      data?.message ||
+      data?.error_description ||
+      raw ||
+      "Nie udało się zaprosić użytkownika.";
+
+    throw Object.assign(new Error(message), {
+      status: response.status,
+      code: response.status === 422 ? "USER_EXISTS" : "AUTH_INVITE_ERROR"
+    });
+  }
+
+  const userId = data?.id || data?.user?.id;
+
+  if (!userId) {
+    throw Object.assign(
+      new Error("Supabase nie zwrócił ID utworzonego użytkownika."),
+      { status: 500, code: "AUTH_RESPONSE_ERROR" }
+    );
+  }
+
+  return userId;
+}
+
+async function deleteAuthUser(env, userId) {
+  if (!userId) return;
+
+  try {
+    await fetch(
+      `${env.SUPABASE_URL}/auth/v1/admin/users/${encodeURIComponent(userId)}`,
+      {
+        method: "DELETE",
+        headers: adminHeaders(env)
+      }
+    );
+  } catch (error) {
+    console.error("Rollback auth user:", error);
+  }
+}
+
+async function deleteAuthUserStrict(env, userId) {
+  if (!userId) return;
+
+  const response = await fetch(
+    `${env.SUPABASE_URL}/auth/v1/admin/users/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: adminHeaders(env) }
+  );
+
+  if (!response.ok && response.status !== 404) {
+    const details = await response.text();
+    throw Object.assign(
+      new Error(`Nie udało się usunąć konta logowania: ${details}`),
+      { status: 502, code: "AUTH_DELETE_ERROR" }
+    );
+  }
+}
+
+async function createTutor(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    throw Object.assign(new Error("Nieprawidłowe dane formularza."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const name = clean(body.name, 160);
+  const email = clean(body.email, 254).toLowerCase();
+  const iban = clean(body.iban, 80);
+  const calSlug = cleanSlug(body.calSlug);
+  const calScheduleId = clean(body.calScheduleId, 120);
+  const timezone = clean(body.timezone || "Europe/Warsaw", 80);
+
+  if (name.length < 2) {
+    throw Object.assign(new Error("Podaj imię i nazwisko korepetytora."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw Object.assign(new Error("Podaj prawidłowy adres e-mail."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  if (!calSlug) {
+    throw Object.assign(new Error("Podaj Cal.com slug korepetytora."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const existingTutor = await selectOne(env, "tutors", { email });
+
+  if (existingTutor) {
+    throw Object.assign(
+      new Error("Korepetytor z takim adresem e-mail już istnieje."),
+      { status: 409, code: "DUPLICATE_EMAIL" }
+    );
+  }
+
+  let authUserId = null;
+  let tutorRow = null;
+
+  try {
+    authUserId = await inviteTutor(env, email, name);
+
+    tutorRow = await insertOne(env, "tutors", {
+      auth_user_id: authUserId,
+      name,
+      email,
+      iban: iban || null,
+      cal_slug: calSlug,
+      cal_url: `https://cal.com/${calSlug}`,
+      cal_schedule_id: calScheduleId || null,
+      timezone,
+      status: "active",
+      onboarding_completed: false
+    });
+
+    await insertOne(env, "user_roles", {
+      user_id: authUserId,
+      role: "tutor"
+    });
+
+    return {
+      tutor: tutorRow,
+      invitation_sent: true
+    };
+  } catch (error) {
+    console.error("Create tutor failed:", error);
+
+    // Best-effort rollback, żeby nie zostawić połowicznie utworzonego konta.
+    if (tutorRow?.id) {
+      await deleteRows(env, "tutors", { id: tutorRow.id });
+    }
+
+    if (authUserId) {
+      await deleteAuthUser(env, authUserId);
+    }
+
+    throw error;
+  }
+}
+
+async function removeTutor(request, env, tutorId) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(tutorId)) {
+    throw Object.assign(new Error("Nieprawidłowe ID korepetytora."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status === "removed") {
+    throw Object.assign(new Error("Korepetytor nie istnieje lub został już usunięty."), {
+      status: 404,
+      code: "TUTOR_NOT_FOUND"
+    });
+  }
+
+  if (tutor.auth_user_id === admin.id) {
+    throw Object.assign(new Error("Nie można usunąć własnego konta administratora."), {
+      status: 409,
+      code: "SELF_DELETE_BLOCKED"
+    });
+  }
+
+  await deleteAuthUserStrict(env, tutor.auth_user_id);
+
+  const removedTutor = await updateOne(env, "tutors", tutor.id, {
+    auth_user_id: null,
+    email: `removed+${tutor.id}@archive.edushot.local`,
+    cal_slug: null,
+    // cal_url is NOT NULL in the existing production schema. A unique,
+    // non-routable tombstone frees the real Cal.com URL without losing history.
+    cal_url: `https://archive.edushot.local/tutors/${tutor.id}`,
+    cal_schedule_id: null,
+    status: "removed",
+    onboarding_completed: false,
+    updated_at: new Date().toISOString()
+  });
+
+  if (tutor.auth_user_id) {
+    await deleteRows(env, "user_roles", { user_id: tutor.auth_user_id });
+  }
+
+  try {
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_removed",
+      entity_type: "tutor",
+      entity_id: tutor.id,
+      details: {
+        tutor_name: tutor.name,
+        previous_email: tutor.email,
+        history_preserved: true
+      }
+    });
+  } catch (error) {
+    console.error("Tutor removal audit log:", error);
+  }
+
+  return {
+    tutor: removedTutor,
+    email_released: true,
+    history_preserved: true
+  };
+}
+
+function assertUuid(value, label = "ID") {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw Object.assign(new Error(`Nieprawidłowe ${label}.`), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+}
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw Object.assign(new Error("Nieprawidłowe dane formularza."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+}
+
+function regularStudentPayload(body) {
+  const studentName = clean(body.studentName, 160);
+  const guardianName = clean(body.guardianName, 160);
+  const guardianEmail = clean(body.guardianEmail, 254).toLowerCase();
+  const guardianPhone = clean(body.guardianPhone, 40);
+  const startedOn = clean(body.startedOn, 10);
+
+  if (studentName.length < 2) {
+    throw Object.assign(new Error("Podaj imię i nazwisko ucznia."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (guardianName.length < 2) {
+    throw Object.assign(new Error("Podaj imię i nazwisko rodzica lub opiekuna."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (!guardianEmail && !guardianPhone) {
+    throw Object.assign(new Error("Podaj e-mail lub telefon rodzica."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (guardianEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guardianEmail)) {
+    throw Object.assign(new Error("Podaj prawidłowy e-mail rodzica."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (startedOn && !/^\d{4}-\d{2}-\d{2}$/.test(startedOn)) {
+    throw Object.assign(new Error("Podaj prawidłową datę rozpoczęcia."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  return {
+    p_student_name: studentName,
+    p_guardian_name: guardianName,
+    p_guardian_email: guardianEmail || null,
+    p_guardian_phone: guardianPhone || null,
+    p_started_on: startedOn || null
+  };
+}
+
+async function createRegularStudent(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularStudentPayload(await readJson(request));
+
+  const studentId = await callRpc(
+    env,
+    "edushot_admin_create_regular_student",
+    {
+      ...payload,
+      p_actor_user_id: admin.id,
+      p_actor_email: admin.email || null
+    }
+  );
+
+  return { student_id: studentId };
+}
+
+async function updateRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularStudentPayload(await readJson(request));
+
+  await callRpc(env, "edushot_admin_update_regular_student", {
+    p_student_id: studentId,
+    ...payload,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId };
+}
+
+async function endRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zakończenia współpracy."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  await callRpc(env, "edushot_admin_set_regular_student_status", {
+    p_student_id: studentId,
+    p_status: "ended",
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId, status: "ended" };
+}
+
+async function reactivateRegularStudent(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+
+  await callRpc(env, "edushot_admin_set_regular_student_status", {
+    p_student_id: studentId,
+    p_status: "active",
+    p_reason: null,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+
+  return { student_id: studentId, status: "active" };
+}
+
+function regularLessonPlanPayload(body) {
+  const tutorId = clean(body.tutorId, 36);
+  const subject = clean(body.subject, 120);
+  const level = clean(body.level, 120);
+  const pricingTier = clean(body.pricingTier, 40);
+  const durationMinutes = Number(body.durationMinutes);
+  const weekday = Number(body.weekday);
+  const startTime = clean(body.startTime, 5);
+  const frequency = clean(body.frequency, 20);
+  const timezone = clean(body.timezone, 80) || "Europe/Warsaw";
+  const meetUrl = clean(body.meetUrl, 500).toLowerCase();
+  const startsOn = clean(body.startsOn, 10);
+
+  assertUuid(tutorId, "ID korepetytora");
+  if (!subject || !level) {
+    throw Object.assign(new Error("Uzupełnij przedmiot i poziom."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!["primary_school", "secondary_basic", "secondary_extended"].includes(pricingTier)) {
+    throw Object.assign(new Error("Wybierz prawidłowy poziom rozliczeniowy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (![30, 60, 90].includes(durationMinutes)) {
+    throw Object.assign(new Error("Długość zajęć musi wynosić 30, 60 albo 90 minut."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!Number.isInteger(weekday) || weekday < 1 || weekday > 7) {
+    throw Object.assign(new Error("Wybierz prawidłowy dzień tygodnia."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+    throw Object.assign(new Error("Podaj prawidłową godzinę rozpoczęcia."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!["weekly", "biweekly"].includes(frequency)) {
+    throw Object.assign(new Error("Wybierz prawidłową częstotliwość."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^https:\/\/meet\.google\.com\/[a-z0-9-]+(?:[/?#].*)?$/i.test(meetUrl)) {
+    throw Object.assign(new Error("Podaj prawidłowy stały link Google Meet."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(startsOn)) {
+    throw Object.assign(new Error("Podaj prawidłową datę rozpoczęcia planu."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+
+  return {
+    p_tutor_id: tutorId,
+    p_subject: subject,
+    p_level: level,
+    p_pricing_tier: pricingTier,
+    p_duration_minutes: durationMinutes,
+    p_weekday: weekday,
+    p_start_time: startTime,
+    p_frequency: frequency,
+    p_timezone: timezone,
+    p_meet_url: meetUrl,
+    p_starts_on: startsOn
+  };
+}
+
+async function replaceRegularLessonPlan(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const payload = regularLessonPlanPayload(await readJson(request));
+  const planId = await callRpc(env, "edushot_admin_replace_regular_lesson_plan", {
+    p_student_id: studentId,
+    ...payload,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { student_id: studentId, plan_id: planId };
+}
+
+async function endRegularLessonPlan(request, env, studentId) {
+  assertUuid(studentId, "ID ucznia");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zakończenia planu."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  await callRpc(env, "edushot_admin_end_regular_lesson_plan", {
+    p_student_id: studentId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { student_id: studentId, status: "ended" };
+}
+
+async function generateRegularLessons(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const horizonDays = Number(body.horizonDays ?? 90);
+  if (!Number.isInteger(horizonDays) || horizonDays < 7 || horizonDays > 366) {
+    throw Object.assign(new Error("Horyzont musi obejmować od 7 do 366 dni."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const result = await callRpc(env, "edushot_generate_all_regular_lessons", {
+    p_horizon_days: horizonDays
+  });
+  return result;
+}
+
+async function addRegularPlanBreak(request, env, planId) {
+  assertUuid(planId, "ID planu");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const dateFrom = clean(body.dateFrom, 10);
+  const dateTo = clean(body.dateTo, 10);
+  const reason = clean(body.reason, 500);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(dateTo) || dateTo < dateFrom) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres przerwy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód przerwy."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const breakId = await callRpc(env, "edushot_admin_add_regular_break", {
+    p_plan_id: planId, p_date_from: dateFrom, p_date_to: dateTo, p_reason: reason,
+    p_actor_user_id: admin.id, p_actor_email: admin.email || null
+  });
+  return { break_id: breakId, plan_id: planId };
+}
+
+async function substituteRegularLesson(request, env, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const reason = clean(body.reason, 500);
+  assertUuid(tutorId, "ID korepetytora zastępującego");
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zastępstwa."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  await callRpc(env, "edushot_admin_substitute_regular_lesson", {
+    p_lesson_id: lessonId, p_substitute_tutor_id: tutorId, p_reason: reason,
+    p_actor_user_id: admin.id, p_actor_email: admin.email || null
+  });
+  return { lesson_id: lessonId, tutor_id: tutorId };
+}
+
+async function substituteRegularOccurrence(request, env, occurrenceId) {
+  assertUuid(occurrenceId, "ID terminu planu");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const reason = clean(body.reason, 500);
+  assertUuid(tutorId, "ID korepetytora zastępującego");
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód zastępstwa."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const lessonId = await callRpc(env, "edushot_admin_substitute_regular_occurrence", {
+    p_occurrence_id: occurrenceId,
+    p_substitute_tutor_id: tutorId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return { occurrence_id: occurrenceId, lesson_id: lessonId, tutor_id: tutorId };
+}
+
+async function addTutorTimeOff(request, env, tutorId) {
+  assertUuid(tutorId, "ID korepetytora");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const dateFrom = clean(body.dateFrom, 10);
+  const dateTo = clean(body.dateTo, 10);
+  const reason = clean(body.reason, 500);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateFrom) || !/^\d{4}-\d{2}-\d{2}$/.test(dateTo) || dateTo < dateFrom) {
+    throw Object.assign(new Error("Podaj prawidłowy zakres nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód nieobecności."), {
+      status: 400,
+      code: "VALIDATION_ERROR"
+    });
+  }
+
+  const tutor = await selectOne(env, "tutors", { id: tutorId });
+  if (!tutor || tutor.status !== "active") {
+    throw Object.assign(new Error("Nie znaleziono aktywnego korepetytora."), {
+      status: 404,
+      code: "TUTOR_NOT_FOUND"
+    });
+  }
+  if (!tutor.cal_schedule_id) {
+    throw Object.assign(new Error("Korepetytor nie ma ustawionego Cal.com Schedule ID."), {
+      status: 409,
+      code: "MISSING_SCHEDULE_ID"
+    });
+  }
+
+  const blockedDates = datesBetween(dateFrom, dateTo);
+  const current = await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" });
+  const schedule = current?.data || current;
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  let overrides = [...originalOverrides];
+  for (const date of blockedDates) {
+    overrides = overrides.filter(item => String(item?.date) !== date);
+    overrides.push({ date, startTime: "00:00", endTime: "00:00" });
+  }
+  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+    method: "PATCH",
+    body: JSON.stringify({ overrides })
+  });
+
+  try {
+    const row = await insertOne(env, "tutor_time_off", {
+      tutor_id: tutorId,
+      date_from: dateFrom,
+      date_to: dateTo,
+      reason
+    });
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_time_off_added",
+      entity_type: "tutor_time_off",
+      entity_id: row.id,
+      details: { tutor_id: tutorId, date_from: dateFrom, date_to: dateTo, reason }
+    });
+    const availabilitySync = await syncTutorSchedules(env, [tutorId]);
+    return { ...row, availability_sync: availabilitySync };
+  } catch (error) {
+    try {
+      await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ overrides: originalOverrides })
+      });
+    } catch (rollbackError) {
+      console.error("Tutor time-off rollback error:", rollbackError);
+    }
+    throw error;
+  }
+}
+
+async function removeTutorTimeOff(request, env, timeOffId) {
+  assertUuid(timeOffId, "ID nieobecności");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const timeOff = await selectOne(env, "tutor_time_off", { id: timeOffId });
+  if (!timeOff) {
+    throw Object.assign(new Error("Nie znaleziono nieobecności."), {
+      status: 404,
+      code: "TIME_OFF_NOT_FOUND"
+    });
+  }
+  const tutor = await selectOne(env, "tutors", { id: timeOff.tutor_id });
+  if (!tutor?.cal_schedule_id) {
+    throw Object.assign(new Error("Korepetytor nie ma ustawionego Cal.com Schedule ID."), {
+      status: 409,
+      code: "MISSING_SCHEDULE_ID"
+    });
+  }
+
+  const blocked = new Set(datesBetween(timeOff.date_from, timeOff.date_to));
+  const current = await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, { method: "GET" });
+  const schedule = current?.data || current;
+  const originalOverrides = Array.isArray(schedule?.overrides) ? [...schedule.overrides] : [];
+  const overrides = originalOverrides.filter(item => !(
+    blocked.has(String(item?.date)) && String(item?.startTime) === "00:00" && String(item?.endTime) === "00:00"
+  ));
+  await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+    method: "PATCH",
+    body: JSON.stringify({ overrides })
+  });
+
+  try {
+    await deleteRows(env, "tutor_time_off", { id: timeOffId });
+    await insertOne(env, "audit_logs", {
+      actor_user_id: admin.id,
+      actor_email: admin.email || null,
+      action: "tutor_time_off_removed",
+      entity_type: "tutor_time_off",
+      entity_id: timeOffId,
+      details: { tutor_id: timeOff.tutor_id, date_from: timeOff.date_from, date_to: timeOff.date_to }
+    });
+    const availabilitySync = await syncTutorSchedules(env, [timeOff.tutor_id]);
+    return { id: timeOffId, deleted: true, availability_sync: availabilitySync };
+  } catch (error) {
+    try {
+      await calRequest(env, `/v2/schedules/${encodeURIComponent(String(tutor.cal_schedule_id))}`, {
+        method: "PATCH",
+        body: JSON.stringify({ overrides: originalOverrides })
+      });
+    } catch (rollbackError) {
+      console.error("Tutor time-off delete rollback error:", rollbackError);
+    }
+    throw error;
+  }
+}
+
+async function cancelLesson(request, env, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód anulowania lekcji."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  const lesson = await selectOne(env, "lessons", { id: lessonId });
+  if (!lesson) {
+    throw Object.assign(new Error("Nie znaleziono lekcji."), {
+      status: 404, code: "LESSON_NOT_FOUND"
+    });
+  }
+  if (!["scheduled", "confirmed"].includes(lesson.status)) {
+    throw Object.assign(new Error("Można anulować tylko przyszłą, aktywną lekcję."), {
+      status: 409, code: "LESSON_NOT_CANCELLABLE"
+    });
+  }
+
+  if (lesson.provider === "cal.com" && lesson.provider_booking_id) {
+    await calRequest(env, `/v2/bookings/${encodeURIComponent(String(lesson.provider_booking_id))}`, {
+      method: "DELETE",
+      headers: { "cal-api-version": "2024-08-13" },
+      body: JSON.stringify({ cancellationReason: reason })
+    });
+  }
+
+  const result = await callRpc(env, "edushot_admin_cancel_lesson", {
+    p_lesson_id: lessonId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+  return result;
+}
+
+async function syncCalAvailability(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const tutorId = clean(body.tutorId, 36);
+  const horizonDays = Number(body.horizonDays ?? 120);
+  if (!Number.isInteger(horizonDays) || horizonDays < 7 || horizonDays > 366) {
+    throw Object.assign(new Error("Horyzont synchronizacji musi obejmować od 7 do 366 dni."), {
+      status: 400, code: "VALIDATION_ERROR"
+    });
+  }
+  if (tutorId) {
+    assertUuid(tutorId, "ID korepetytora");
+    return syncTutorSchedules(env, [tutorId], horizonDays);
+  }
+  return syncEveryTutorCalSchedule(env, horizonDays);
+}
+
+function isoMonthStart(date = new Date()) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-01`;
+}
+
+function shiftUtcMonth(date, offset) {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + offset, 1));
+}
+
+function inFilter(values) {
+  return `in.(${values.map(value => `"${String(value).replaceAll('"', '')}"`).join(",")})`;
+}
+
+async function portalGuardian(env, email) {
+  const guardians = await selectRows(env, "guardians", params => {
+    params.set("email", `eq.${email}`);
+    params.set("limit", "1");
+  }, "id,name,email,phone");
+  const guardian = guardians[0];
+  if (!guardian) return null;
+  return guardian;
+}
+
+async function getPortalWorkspace(request, env) {
+  const email = await assertPortalRequest(request, env);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    return { guardian: null, students: [], plans: [], lessons: [], cycles: [], items: [], payments: [], requests: [] };
+  }
+
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id,
+      p_period_start: isoMonthStart(now)
+    }),
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id,
+      p_period_start: isoMonthStart(shiftUtcMonth(now, -1))
+    })
+  ]);
+
+  const links = await selectRows(env, "student_guardians", params => {
+    params.set("guardian_id", `eq.${guardian.id}`);
+  }, "student_id,is_primary,relationship");
+  const studentIds = links.map(link => link.student_id);
+  const [cycles, payments, requests] = await Promise.all([
+    selectRows(env, "guardian_billing_cycles", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "period_start.desc");
+      params.set("limit", "18");
+    }, "id,period_start,period_end,due_date,status,subtotal,adjustments_total,paid_total,balance_due,currency,opened_at,paid_at"),
+    selectRows(env, "guardian_payments", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "created_at.desc");
+      params.set("limit", "50");
+    }, "id,method,status,amount,currency,payer_reference,declared_at,received_at,verified_at,created_at"),
+    selectRows(env, "guardian_portal_requests", params => {
+      params.set("guardian_id", `eq.${guardian.id}`);
+      params.set("order", "created_at.desc");
+      params.set("limit", "50");
+    }, "id,student_id,lesson_id,request_type,status,requested_payload,resolution_note,resolved_at,created_at")
+  ]);
+
+  if (!studentIds.length) {
+    return { guardian, students: [], plans: [], lessons: [], cycles, items: [], payments, requests };
+  }
+  const studentFilter = inFilter(studentIds);
+  const lessonFrom = isoMonthStart(shiftUtcMonth(now, -6));
+  const [students, plans, lessons] = await Promise.all([
+    selectRows(env, "students", params => {
+      params.set("id", studentFilter);
+      params.set("order", "name.asc");
+    }, "id,name,status,student_kind,started_on,ended_on"),
+    selectRows(env, "regular_lesson_plans", params => {
+      params.set("student_id", studentFilter);
+      params.set("order", "starts_on.desc");
+    }, "id,student_id,tutor_id,subject,level,duration_minutes,weekday,start_time,frequency,timezone,meet_url,starts_on,ends_on,status"),
+    selectRows(env, "lessons", params => {
+      params.set("student_id", studentFilter);
+      params.set("start_at", `gte.${lessonFrom}T00:00:00Z`);
+      params.set("order", "start_at.asc");
+      params.set("limit", "500");
+    }, "id,student_id,tutor_id,regular_plan_id,student_name,subject,level,start_at,end_at,duration_minutes,status,meet_url,cancelled_at,cancellation_notice_minutes,cancellation_refund_eligible")
+  ]);
+  const cycleIds = cycles.map(cycle => cycle.id);
+  const items = cycleIds.length ? await selectRows(env, "guardian_billing_items", params => {
+    params.set("cycle_id", inFilter(cycleIds));
+    params.set("order", "service_date.desc");
+  }, "id,cycle_id,lesson_id,student_id,item_type,description,service_date,amount,status") : [];
+  const tutorIds = [...new Set([...plans, ...lessons].map(row => row.tutor_id).filter(Boolean))];
+  const tutors = tutorIds.length ? await selectRows(env, "tutors", params => {
+    params.set("id", inFilter(tutorIds));
+  }, "id,name") : [];
+  const tutorNames = Object.fromEntries(tutors.map(tutor => [tutor.id, tutor.name]));
+  return {
+    guardian,
+    students,
+    plans: plans.map(plan => ({ ...plan, tutor_name: tutorNames[plan.tutor_id] || "Korepetytor EduSHOT" })),
+    lessons: lessons.map(lesson => ({ ...lesson, tutor_name: tutorNames[lesson.tutor_id] || "Korepetytor EduSHOT" })),
+    cycles, items, payments, requests
+  };
+}
+
+async function getAdminBilling(request, env) {
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_all_guardian_billing", { p_period_start: isoMonthStart(now) }),
+    callRpc(env, "edushot_refresh_all_guardian_billing", { p_period_start: isoMonthStart(shiftUtcMonth(now, -1)) })
+  ]);
+  const [guardians, cycles, items, payments, allocations, requests] = await Promise.all([
+    selectRows(env, "guardians", params => params.set("order", "name.asc"), "id,name,email,phone"),
+    selectRows(env, "guardian_billing_cycles", params => {
+      params.set("order", "period_start.desc"); params.set("limit", "500");
+    }, "id,guardian_id,period_start,period_end,due_date,status,subtotal,adjustments_total,paid_total,balance_due,currency,opened_at,paid_at"),
+    selectRows(env, "guardian_billing_items", params => {
+      params.set("order", "service_date.desc"); params.set("limit", "1500");
+    }, "id,cycle_id,lesson_id,student_id,item_type,description,service_date,amount,status"),
+    selectRows(env, "guardian_payments", params => {
+      params.set("order", "created_at.desc"); params.set("limit", "500");
+    }, "id,guardian_id,method,status,amount,currency,provider,payer_reference,declared_at,received_at,verified_at,verified_by,note,created_at"),
+    selectRows(env, "guardian_payment_allocations", params => params.set("limit", "1500"), "payment_id,cycle_id,amount,created_at"),
+    selectRows(env, "guardian_portal_requests", params => {
+      params.set("order", "created_at.desc"); params.set("limit", "500");
+    }, "id,guardian_id,student_id,lesson_id,request_type,status,requested_payload,resolution_note,resolved_at,created_at")
+  ]);
+  return { guardians, cycles, items, payments, allocations, requests };
+}
+
+async function verifyGuardianPayment(request, env, paymentId) {
+  assertUuid(paymentId, "ID wpłaty");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const receivedAt = clean(body.receivedAt, 40);
+  const note = clean(body.note, 500);
+  if (receivedAt && !Number.isFinite(Date.parse(receivedAt))) {
+    throw Object.assign(new Error("Podaj prawidłową datę otrzymania wpłaty."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return callRpc(env, "edushot_admin_verify_guardian_payment", {
+    p_payment_id: paymentId,
+    p_received_at: receivedAt || null,
+    p_admin_note: note || null,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+}
+
+async function reverseGuardianPayment(request, env, paymentId) {
+  assertUuid(paymentId, "ID wpłaty");
+  const admin = await getSignedInUser(request, env);
+  await assertAdmin(admin, env);
+  const body = await readJson(request);
+  const reason = clean(body.reason, 500);
+  if (!reason) {
+    throw Object.assign(new Error("Podaj powód cofnięcia wpłaty."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return callRpc(env, "edushot_admin_reverse_guardian_payment", {
+    p_payment_id: paymentId,
+    p_reason: reason,
+    p_actor_user_id: admin.id,
+    p_actor_email: admin.email || null
+  });
+}
+
+async function portalLessonOwnedBy(env, guardianId, lessonId) {
+  assertUuid(lessonId, "ID lekcji");
+  const lessons = await selectRows(env, "lessons", params => {
+    params.set("id", `eq.${lessonId}`);
+    params.set("limit", "1");
+  }, "id,student_id,start_at,status");
+  const lesson = lessons[0];
+  if (!lesson) return null;
+  const links = await selectRows(env, "student_guardians", params => {
+    params.set("guardian_id", `eq.${guardianId}`);
+    params.set("student_id", `eq.${lesson.student_id}`);
+    params.set("limit", "1");
+  }, "student_id");
+  return links.length ? lesson : null;
+}
+
+function parsePortalJson(rawBody) {
+  try { return rawBody ? JSON.parse(rawBody) : {}; }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowe dane formularza."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+}
+
+async function cancelPortalLesson(request, env, lessonId) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian || !await portalLessonOwnedBy(env, guardian.id, lessonId)) {
+    throw Object.assign(new Error("Nie znaleziono lekcji na tym koncie."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const reason = clean(body.reason, 500) || "Anulowanie zgłoszone w panelu rodzica";
+  return callRpc(env, "edushot_admin_cancel_lesson", {
+    p_lesson_id: lessonId,
+    p_reason: reason,
+    p_actor_user_id: null,
+    p_actor_email: `portal:${email}`
+  });
+}
+
+async function requestPortalReschedule(request, env, lessonId) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  const lesson = guardian && await portalLessonOwnedBy(env, guardian.id, lessonId);
+  if (!guardian || !lesson) {
+    throw Object.assign(new Error("Nie znaleziono lekcji na tym koncie."), { status: 404, code: "NOT_FOUND" });
+  }
+  if (new Date(lesson.start_at).getTime() <= Date.now()) {
+    throw Object.assign(new Error("Nie można przełożyć rozpoczętej lekcji."), { status: 409, code: "LESSON_ALREADY_STARTED" });
+  }
+  const body = parsePortalJson(rawBody);
+  const requestedStartAt = clean(body.requestedStartAt, 40);
+  const note = clean(body.note, 500);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  if (!idempotencyKey || (requestedStartAt && !Number.isFinite(Date.parse(requestedStartAt)))) {
+    throw Object.assign(new Error("Uzupełnij prawidłowe dane prośby o przełożenie."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  return insertOne(env, "guardian_portal_requests", {
+    guardian_id: guardian.id,
+    student_id: lesson.student_id,
+    lesson_id: lessonId,
+    request_type: "reschedule",
+    requested_payload: { requested_start_at: requestedStartAt || null, note },
+    idempotency_key: idempotencyKey
+  });
+}
+
+async function declarePortalBankTransfer(request, env) {
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    throw Object.assign(new Error("Konto nie ma jeszcze stałych lekcji EduSHOT."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const amount = Number(body.amount);
+  const payerReference = clean(body.payerReference, 160);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  return callRpc(env, "edushot_declare_bank_transfer", {
+    p_guardian_id: guardian.id,
+    p_amount: amount,
+    p_payer_reference: payerReference,
+    p_idempotency_key: idempotencyKey
+  });
+}
+
+function stripeReturnUrl(env, result) {
+  let url;
+  try { url = new URL(env.PORTAL_RETURN_URL); }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowy adres powrotu z płatności."), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+  if (url.protocol !== "https:" && url.hostname !== "localhost") {
+    throw Object.assign(new Error("Adres powrotu z płatności musi używać HTTPS."), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+  url.searchParams.set("payment", result);
+  if (result === "success") url.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+  return url.toString();
+}
+
+async function createPortalCheckoutSession(request, env) {
+  assertStripeConfig(env, "checkout");
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    throw Object.assign(new Error("Konto nie ma jeszcze stałych lekcji EduSHOT."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const amount = Number(body.amount);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  if (!Number.isFinite(amount) || !idempotencyKey) {
+    throw Object.assign(new Error("Podaj prawidłową kwotę i klucz operacji."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id, p_period_start: isoMonthStart(now)
+    }),
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id, p_period_start: isoMonthStart(shiftUtcMonth(now, -1))
+    })
+  ]);
+  const payment = await callRpc(env, "edushot_create_stripe_payment", {
+    p_guardian_id: guardian.id,
+    p_amount: amount,
+    p_idempotency_key: idempotencyKey
+  });
+  const amountMinor = Math.round(Number(payment.amount) * 100);
+  const form = new URLSearchParams();
+  form.set("mode", "payment");
+  form.set("success_url", stripeReturnUrl(env, "success"));
+  form.set("cancel_url", stripeReturnUrl(env, "cancelled"));
+  form.set("customer_email", guardian.email);
+  form.set("client_reference_id", guardian.id);
+  form.set("locale", "pl");
+  form.set("submit_type", "pay");
+  form.set("line_items[0][price_data][currency]", "pln");
+  form.set("line_items[0][price_data][unit_amount]", String(amountMinor));
+  form.set("line_items[0][price_data][product_data][name]", "Lekcje EduSHOT");
+  form.set("line_items[0][quantity]", "1");
+  form.set("metadata[guardian_payment_id]", payment.id);
+  form.set("metadata[guardian_id]", guardian.id);
+  form.set("payment_intent_data[metadata][guardian_payment_id]", payment.id);
+
+  const stripeResponse = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.STRIPE_SECRET_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Idempotency-Key": `edushot-${payment.id}`
+    },
+    body: form.toString()
+  });
+  const stripeRaw = await stripeResponse.text();
+  let session = null;
+  try { session = stripeRaw ? JSON.parse(stripeRaw) : null; } catch {}
+  if (!stripeResponse.ok || !session?.id || !session?.url) {
+    throw Object.assign(new Error(session?.error?.message || "Nie udało się rozpocząć płatności online."), {
+      status: 502, code: "STRIPE_API_ERROR"
+    });
+  }
+  await updateOne(env, "guardian_payments", payment.id, {
+    provider_reference: session.id,
+    note: "Utworzono sesję Stripe Checkout."
+  });
+  return { paymentId: payment.id, checkoutSessionId: session.id, checkoutUrl: session.url };
+}
+
+async function handleStripeWebhook(request, env) {
+  const rawBody = await request.text();
+  await assertStripeWebhook(request, env, rawBody);
+  let event;
+  try { event = JSON.parse(rawBody); }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowa treść webhooka Stripe."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  const session = event?.data?.object || {};
+  const paymentId = clean(session?.metadata?.guardian_payment_id, 36);
+  const relevant = new Set([
+    "checkout.session.completed", "checkout.session.async_payment_succeeded",
+    "checkout.session.async_payment_failed", "checkout.session.expired"
+  ]);
+  if (!relevant.has(event?.type)) return { received: true, ignored: true };
+  assertUuid(paymentId, "ID wpłaty Stripe");
+
+  const paid = event.type === "checkout.session.async_payment_succeeded"
+    || (event.type === "checkout.session.completed" && session.payment_status === "paid");
+  if (paid) {
+    const data = await callRpc(env, "edushot_settle_stripe_payment", {
+      p_payment_id: paymentId,
+      p_checkout_session_id: clean(session.id, 255),
+      p_payment_intent_id: clean(session.payment_intent, 255) || null,
+      p_amount_minor: Number(session.amount_total),
+      p_currency: clean(session.currency, 8),
+      p_received_at: new Date(Number(event.created) * 1000).toISOString(),
+      p_event_id: clean(event.id, 255),
+      p_event_type: clean(event.type, 120)
+    });
+    return { received: true, settled: true, data };
+  }
+  if (event.type === "checkout.session.completed") {
+    return { received: true, pending: true };
+  }
+  const data = await callRpc(env, "edushot_fail_stripe_payment", {
+    p_payment_id: paymentId,
+    p_checkout_session_id: clean(session.id, 255),
+    p_event_id: clean(event.id, 255),
+    p_event_type: clean(event.type, 120)
+  });
+  return { received: true, failed: true, data };
+}
+
+export default {
+  scheduled(_event, env, ctx) {
+    ctx.waitUntil(safeSyncAllTutorSchedules(env, 120));
+  },
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders(request, env)
+      });
+    }
+
+    try {
+      assertConfig(env);
+
+      if (request.method === "GET" && url.pathname === "/api/health") {
+        return json(request, env, {
+          ok: true,
+          data: {
+            service: "EduSHOT Admin API",
+            status: "online",
+            timestamp: new Date().toISOString()
+          }
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/webhook/stripe") {
+        const data = await handleStripeWebhook(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/portal/workspace") {
+        const data = await getPortalWorkspace(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/portal/bank-transfer-declarations") {
+        const data = await declarePortalBankTransfer(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/portal/checkout-sessions") {
+        const data = await createPortalCheckoutSession(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const portalLessonCancelMatch = url.pathname.match(
+        /^\/api\/portal\/lessons\/([^/]+)\/cancel$/
+      );
+      if (request.method === "POST" && portalLessonCancelMatch) {
+        const data = await cancelPortalLesson(
+          request, env, decodeURIComponent(portalLessonCancelMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const portalLessonRescheduleMatch = url.pathname.match(
+        /^\/api\/portal\/lessons\/([^/]+)\/reschedule-request$/
+      );
+      if (request.method === "POST" && portalLessonRescheduleMatch) {
+        const data = await requestPortalReschedule(
+          request, env, decodeURIComponent(portalLessonRescheduleMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/tutors") {
+        const data = await createTutor(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/regular-students") {
+        const data = await createRegularStudent(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/regular-plans/generate") {
+        const data = await generateRegularLessons(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/cal-availability/sync") {
+        const data = await syncCalAvailability(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/billing") {
+        const data = await getAdminBilling(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
+      const guardianPaymentMatch = url.pathname.match(
+        /^\/api\/admin\/billing\/payments\/([^/]+)\/(verify|reverse)$/
+      );
+      if (request.method === "POST" && guardianPaymentMatch) {
+        const paymentId = decodeURIComponent(guardianPaymentMatch[1]);
+        const data = guardianPaymentMatch[2] === "verify"
+          ? await verifyGuardianPayment(request, env, paymentId)
+          : await reverseGuardianPayment(request, env, paymentId);
+        return json(request, env, { ok: true, data });
+      }
+
+      const lessonCancelMatch = url.pathname.match(
+        /^\/api\/admin\/lessons\/([^/]+)\/cancel$/
+      );
+      if (request.method === "POST" && lessonCancelMatch) {
+        const data = await cancelLesson(
+          request, env, decodeURIComponent(lessonCancelMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularPlanBreakMatch = url.pathname.match(
+        /^\/api\/admin\/regular-plans\/([^/]+)\/breaks$/
+      );
+      if (request.method === "POST" && regularPlanBreakMatch) {
+        const data = await addRegularPlanBreak(
+          request, env, decodeURIComponent(regularPlanBreakMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const regularLessonSubstituteMatch = url.pathname.match(
+        /^\/api\/admin\/regular-lessons\/([^/]+)\/substitute$/
+      );
+      if (request.method === "POST" && regularLessonSubstituteMatch) {
+        const data = await substituteRegularLesson(
+          request, env, decodeURIComponent(regularLessonSubstituteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularOccurrenceSubstituteMatch = url.pathname.match(
+        /^\/api\/admin\/regular-occurrences\/([^/]+)\/substitute$/
+      );
+      if (request.method === "POST" && regularOccurrenceSubstituteMatch) {
+        const data = await substituteRegularOccurrence(
+          request, env, decodeURIComponent(regularOccurrenceSubstituteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const tutorTimeOffMatch = url.pathname.match(
+        /^\/api\/admin\/tutors\/([^/]+)\/time-off$/
+      );
+      if (request.method === "POST" && tutorTimeOffMatch) {
+        const data = await addTutorTimeOff(
+          request, env, decodeURIComponent(tutorTimeOffMatch[1])
+        );
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      const timeOffDeleteMatch = url.pathname.match(
+        /^\/api\/admin\/tutor-time-off\/([^/]+)$/
+      );
+      if (request.method === "DELETE" && timeOffDeleteMatch) {
+        const data = await removeTutorTimeOff(
+          request, env, decodeURIComponent(timeOffDeleteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularStudentReactivateMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)\/reactivate$/
+      );
+      if (request.method === "POST" && regularStudentReactivateMatch) {
+        const data = await reactivateRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentReactivateMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularStudentPlanMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)\/plan$/
+      );
+      if (request.method === "PUT" && regularStudentPlanMatch) {
+        const data = await replaceRegularLessonPlan(
+          request, env, decodeURIComponent(regularStudentPlanMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+      if (request.method === "DELETE" && regularStudentPlanMatch) {
+        const data = await endRegularLessonPlan(
+          request, env, decodeURIComponent(regularStudentPlanMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const regularStudentMatch = url.pathname.match(
+        /^\/api\/admin\/regular-students\/([^/]+)$/
+      );
+      if (request.method === "PATCH" && regularStudentMatch) {
+        const data = await updateRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+      if (request.method === "DELETE" && regularStudentMatch) {
+        const data = await endRegularStudent(
+          request,
+          env,
+          decodeURIComponent(regularStudentMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      const tutorDeleteMatch = url.pathname.match(/^\/api\/admin\/tutors\/([^/]+)$/);
+      if (request.method === "DELETE" && tutorDeleteMatch) {
+        const data = await removeTutor(
+          request,
+          env,
+          decodeURIComponent(tutorDeleteMatch[1])
+        );
+        return json(request, env, { ok: true, data });
+      }
+
+      return json(request, env, {
+        ok: false,
+        error: {
+          code: "NOT_FOUND",
+          message: "Nie znaleziono endpointu."
+        }
+      }, 404);
+    } catch (error) {
+      console.error("EduSHOT Admin API:", error);
+
+      return json(request, env, {
+        ok: false,
+        error: {
+          code: error.code || "SERVER_ERROR",
+          message: error.message || "Wewnętrzny błąd serwera."
+        }
+      }, error.status || 500);
+    }
+  }
+};
+

@@ -1,0 +1,13 @@
+{
+  "name": "edushot-panel",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node --check workers/admin-api/src/index.js && node --check workers/calcom-sync/src/index.js",
+    "test": "node --test workers/admin-api/tests/regular-students.test.mjs workers/calcom-sync/tests/webhook-signature.test.mjs"
+  }
+}
+
