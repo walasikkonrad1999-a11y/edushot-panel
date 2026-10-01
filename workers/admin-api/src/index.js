@@ -26,6 +26,8 @@
  * POST /api/portal/lessons/:id/cancel
  * POST /api/portal/lessons/:id/reschedule-request
  * POST /api/portal/bank-transfer-declarations
+ * POST /api/portal/checkout-sessions
+ * POST /api/webhook/stripe
  *
  * Wymagane Variables / Secrets w Cloudflare:
  * SUPABASE_URL
@@ -34,6 +36,9 @@
  * TUTOR_INVITE_REDIRECT
  * ALLOWED_ORIGINS
  * PORTAL_SHARED_SECRET (wspólny wyłącznie dla serwera edushot.pl i tego API)
+ * PORTAL_RETURN_URL (adres panelu rodzica po zakończeniu Stripe Checkout)
+ * STRIPE_SECRET_KEY
+ * STRIPE_WEBHOOK_SECRET
  *
  * SUPABASE_SECRET_KEY:
  * - najlepiej nowy klucz sb_secret_...
@@ -116,6 +121,38 @@ async function portalSignature(secret, value) {
     "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
   );
   return bytesToHex(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
+}
+
+async function hmacSha256(secret, value) {
+  return portalSignature(secret, value);
+}
+
+function assertStripeConfig(env, mode = "checkout") {
+  const missing = [];
+  if (mode === "checkout" && !env.STRIPE_SECRET_KEY) missing.push("STRIPE_SECRET_KEY");
+  if (mode === "checkout" && !env.PORTAL_RETURN_URL) missing.push("PORTAL_RETURN_URL");
+  if (mode === "webhook" && !env.STRIPE_WEBHOOK_SECRET) missing.push("STRIPE_WEBHOOK_SECRET");
+  if (missing.length) {
+    throw Object.assign(new Error(`Płatności online nie są jeszcze skonfigurowane: ${missing.join(", ")}.`), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+}
+
+async function assertStripeWebhook(request, env, rawBody) {
+  assertStripeConfig(env, "webhook");
+  const signature = request.headers.get("Stripe-Signature") || "";
+  const parts = signature.split(",").map(part => part.trim().split("=", 2));
+  const timestamp = parts.find(([key]) => key === "t")?.[1] || "";
+  const candidates = parts.filter(([key]) => key === "v1").map(([, value]) => value || "");
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isFinite(timestampMs) || Math.abs(Date.now() - timestampMs) > 5 * 60 * 1000) {
+    throw Object.assign(new Error("Webhook Stripe wygasł."), { status: 400, code: "STRIPE_SIGNATURE_ERROR" });
+  }
+  const expected = await hmacSha256(env.STRIPE_WEBHOOK_SECRET, `${timestamp}.${rawBody}`);
+  if (!candidates.some(candidate => /^[0-9a-f]{64}$/i.test(candidate) && constantTimeEqual(expected, candidate.toLowerCase()))) {
+    throw Object.assign(new Error("Nieprawidłowy podpis webhooka Stripe."), { status: 400, code: "STRIPE_SIGNATURE_ERROR" });
+  }
 }
 
 async function assertPortalRequest(request, env, rawBody = "") {
@@ -1589,6 +1626,138 @@ async function declarePortalBankTransfer(request, env) {
   });
 }
 
+function stripeReturnUrl(env, result) {
+  let url;
+  try { url = new URL(env.PORTAL_RETURN_URL); }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowy adres powrotu z płatności."), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+  if (url.protocol !== "https:" && url.hostname !== "localhost") {
+    throw Object.assign(new Error("Adres powrotu z płatności musi używać HTTPS."), {
+      status: 503, code: "STRIPE_CONFIG_ERROR"
+    });
+  }
+  url.searchParams.set("payment", result);
+  if (result === "success") url.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}");
+  return url.toString();
+}
+
+async function createPortalCheckoutSession(request, env) {
+  assertStripeConfig(env, "checkout");
+  const rawBody = await request.text();
+  const email = await assertPortalRequest(request, env, rawBody);
+  const guardian = await portalGuardian(env, email);
+  if (!guardian) {
+    throw Object.assign(new Error("Konto nie ma jeszcze stałych lekcji EduSHOT."), { status: 404, code: "NOT_FOUND" });
+  }
+  const body = parsePortalJson(rawBody);
+  const amount = Number(body.amount);
+  const idempotencyKey = clean(body.idempotencyKey, 120);
+  if (!Number.isFinite(amount) || !idempotencyKey) {
+    throw Object.assign(new Error("Podaj prawidłową kwotę i klucz operacji."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+
+  const now = new Date();
+  await Promise.all([
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id, p_period_start: isoMonthStart(now)
+    }),
+    callRpc(env, "edushot_refresh_guardian_billing", {
+      p_guardian_id: guardian.id, p_period_start: isoMonthStart(shiftUtcMonth(now, -1))
+    })
+  ]);
+  const payment = await callRpc(env, "edushot_create_stripe_payment", {
+    p_guardian_id: guardian.id,
+    p_amount: amount,
+    p_idempotency_key: idempotencyKey
+  });
+  const amountMinor = Math.round(Number(payment.amount) * 100);
+  const form = new URLSearchParams();
+  form.set("mode", "payment");
+  form.set("success_url", stripeReturnUrl(env, "success"));
+  form.set("cancel_url", stripeReturnUrl(env, "cancelled"));
+  form.set("customer_email", guardian.email);
+  form.set("client_reference_id", guardian.id);
+  form.set("locale", "pl");
+  form.set("submit_type", "pay");
+  form.set("line_items[0][price_data][currency]", "pln");
+  form.set("line_items[0][price_data][unit_amount]", String(amountMinor));
+  form.set("line_items[0][price_data][product_data][name]", "Lekcje EduSHOT");
+  form.set("line_items[0][quantity]", "1");
+  form.set("metadata[guardian_payment_id]", payment.id);
+  form.set("metadata[guardian_id]", guardian.id);
+  form.set("payment_intent_data[metadata][guardian_payment_id]", payment.id);
+
+  const stripeResponse = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.STRIPE_SECRET_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Idempotency-Key": `edushot-${payment.id}`
+    },
+    body: form.toString()
+  });
+  const stripeRaw = await stripeResponse.text();
+  let session = null;
+  try { session = stripeRaw ? JSON.parse(stripeRaw) : null; } catch {}
+  if (!stripeResponse.ok || !session?.id || !session?.url) {
+    throw Object.assign(new Error(session?.error?.message || "Nie udało się rozpocząć płatności online."), {
+      status: 502, code: "STRIPE_API_ERROR"
+    });
+  }
+  await updateOne(env, "guardian_payments", payment.id, {
+    provider_reference: session.id,
+    note: "Utworzono sesję Stripe Checkout."
+  });
+  return { paymentId: payment.id, checkoutSessionId: session.id, checkoutUrl: session.url };
+}
+
+async function handleStripeWebhook(request, env) {
+  const rawBody = await request.text();
+  await assertStripeWebhook(request, env, rawBody);
+  let event;
+  try { event = JSON.parse(rawBody); }
+  catch {
+    throw Object.assign(new Error("Nieprawidłowa treść webhooka Stripe."), { status: 400, code: "VALIDATION_ERROR" });
+  }
+  const session = event?.data?.object || {};
+  const paymentId = clean(session?.metadata?.guardian_payment_id, 36);
+  const relevant = new Set([
+    "checkout.session.completed", "checkout.session.async_payment_succeeded",
+    "checkout.session.async_payment_failed", "checkout.session.expired"
+  ]);
+  if (!relevant.has(event?.type)) return { received: true, ignored: true };
+  assertUuid(paymentId, "ID wpłaty Stripe");
+
+  const paid = event.type === "checkout.session.async_payment_succeeded"
+    || (event.type === "checkout.session.completed" && session.payment_status === "paid");
+  if (paid) {
+    const data = await callRpc(env, "edushot_settle_stripe_payment", {
+      p_payment_id: paymentId,
+      p_checkout_session_id: clean(session.id, 255),
+      p_payment_intent_id: clean(session.payment_intent, 255) || null,
+      p_amount_minor: Number(session.amount_total),
+      p_currency: clean(session.currency, 8),
+      p_received_at: new Date(Number(event.created) * 1000).toISOString(),
+      p_event_id: clean(event.id, 255),
+      p_event_type: clean(event.type, 120)
+    });
+    return { received: true, settled: true, data };
+  }
+  if (event.type === "checkout.session.completed") {
+    return { received: true, pending: true };
+  }
+  const data = await callRpc(env, "edushot_fail_stripe_payment", {
+    p_payment_id: paymentId,
+    p_checkout_session_id: clean(session.id, 255),
+    p_event_id: clean(event.id, 255),
+    p_event_type: clean(event.type, 120)
+  });
+  return { received: true, failed: true, data };
+}
+
 export default {
   scheduled(_event, env, ctx) {
     ctx.waitUntil(safeSyncAllTutorSchedules(env, 120));
@@ -1617,6 +1786,11 @@ export default {
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/api/webhook/stripe") {
+        const data = await handleStripeWebhook(request, env);
+        return json(request, env, { ok: true, data });
+      }
+
       if (request.method === "GET" && url.pathname === "/api/portal/workspace") {
         const data = await getPortalWorkspace(request, env);
         return json(request, env, { ok: true, data });
@@ -1624,6 +1798,11 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/portal/bank-transfer-declarations") {
         const data = await declarePortalBankTransfer(request, env);
+        return json(request, env, { ok: true, data }, 201);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/portal/checkout-sessions") {
+        const data = await createPortalCheckoutSession(request, env);
         return json(request, env, { ok: true, data }, 201);
       }
 

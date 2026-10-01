@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import worker from "../src/index.js";
 
 const env = {
@@ -9,6 +10,76 @@ const env = {
   CAL_API_KEY: "cal_test_key",
   ALLOWED_ORIGINS: "https://panel.edushot.workers.dev"
 };
+
+function stripeRequest(payload, secret = "whsec_test_secret") {
+  const raw = JSON.stringify(payload);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = createHmac("sha256", secret).update(`${timestamp}.${raw}`).digest("hex");
+  return new Request("https://api.example/api/webhook/stripe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Stripe-Signature": `t=${timestamp},v1=${signature}` },
+    body: raw
+  });
+}
+
+test("rejects a Stripe webhook with an invalid signature", async () => {
+  const response = await worker.fetch(new Request("https://api.example/api/webhook/stripe", {
+    method: "POST",
+    headers: { "Stripe-Signature": `t=${Math.floor(Date.now() / 1000)},v1=${"0".repeat(64)}` },
+    body: JSON.stringify({ id: "evt_invalid", type: "checkout.session.completed", data: { object: {} } })
+  }), { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_secret" });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.error.code, "STRIPE_SIGNATURE_ERROR");
+});
+
+test("settles a paid Stripe Checkout session exactly through the database RPC", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input); calls.push({ url, init });
+    if (url.endsWith("/rest/v1/rpc/edushot_settle_stripe_payment")) {
+      return jsonResponse({ payment_id: "22222222-2222-4222-8222-222222222222", status: "succeeded" });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  try {
+    const event = {
+      id: "evt_paid_1", type: "checkout.session.completed", created: Math.floor(Date.now() / 1000),
+      data: { object: {
+        id: "cs_test_1", payment_status: "paid", payment_intent: "pi_test_1",
+        amount_total: 7000, currency: "pln",
+        metadata: { guardian_payment_id: "22222222-2222-4222-8222-222222222222" }
+      } }
+    };
+    const response = await worker.fetch(stripeRequest(event), { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_secret" });
+    assert.equal(response.status, 200);
+    const rpc = calls.find(call => call.url.endsWith("/rest/v1/rpc/edushot_settle_stripe_payment"));
+    assert.ok(rpc);
+    const payload = JSON.parse(rpc.init.body);
+    assert.equal(payload.p_amount_minor, 7000);
+    assert.equal(payload.p_checkout_session_id, "cs_test_1");
+    assert.equal(payload.p_event_id, "evt_paid_1");
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("keeps an asynchronous Stripe Checkout session pending until payment succeeds", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => { throw new Error(`Unexpected request: ${String(input)}`); };
+  try {
+    const event = {
+      id: "evt_pending_1", type: "checkout.session.completed", created: Math.floor(Date.now() / 1000),
+      data: { object: {
+        id: "cs_test_pending", payment_status: "unpaid", amount_total: 7000, currency: "pln",
+        metadata: { guardian_payment_id: "22222222-2222-4222-8222-222222222222" }
+      } }
+    };
+    const response = await worker.fetch(stripeRequest(event), { ...env, STRIPE_WEBHOOK_SECRET: "whsec_test_secret" });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.data.pending, true);
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), {
